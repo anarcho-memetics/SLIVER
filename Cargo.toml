@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/sliver_math", "crates/sliver_engine"]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1

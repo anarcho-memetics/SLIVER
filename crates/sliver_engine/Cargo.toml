@@ -1,0 +1,8 @@
+[package]
+name = "sliver_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sliver_math = { path = "../sliver_math" }
+minifb = "0.27"
