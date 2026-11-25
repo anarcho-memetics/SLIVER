@@ -35,7 +35,7 @@ fn main() {
     let mut sliver_count = tag_slivers(&mut world_tris, THRESHOLDS[thresh_idx]);
 
     let mut window = Window::new(
-        "retro_engine",
+        "sliver_engine",
         W,
         H,
         WindowOptions {
@@ -157,7 +157,7 @@ fn main() {
                 "NORMAL"
             };
             window.set_title(&format!(
-                "retro_engine | {:.0} FPS ({:.2} ms) | tris: {}/{} | slivers (<{}°): {} | [F1] {}",
+                "sliver_engine | {:.0} FPS ({:.2} ms) | tris: {}/{} | slivers (<{}°): {} | [F1] {}",
                 fps,
                 avg_render_ms,
                 drawn,
