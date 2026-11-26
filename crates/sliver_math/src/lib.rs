@@ -2,6 +2,10 @@
 
 pub mod vec3;
 pub use vec3::Vec3;
+pub mod ray;
+pub use ray::{ray_triangle, RayHit};
+pub mod contact;
+pub use contact::{closest_point_on_triangle, sphere_triangle, SphereContact};
 
 /// Sliver triangle detector based on the factored chord / half-angle inequality:
 ///   (min - (max - mid)) * (min + (max - mid)) < s0^2 * mid * max

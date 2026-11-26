@@ -1,8 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod collision;
+mod controller;
+mod motion;
 mod raster;
+mod raycast;
 mod scene;
 
+use controller::{WalkConfig, Walker};
 use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use raster::{Camera, Framebuffer, RenderConfig};
 use scene::{build_demo_room, build_spinner, load_obj, tag_slivers};
@@ -14,6 +19,9 @@ use std::time::Instant;
 const W: usize = 960;
 const H: usize = 540;
 const THRESHOLDS: [f32; 4] = [1.0, 5.0, 12.0, 25.0];
+
+const STEP: f32 = 1.0 / 120.0; // fixed physics timestep
+const EYE_HEIGHT: f32 = 1.65;
 
 fn main() {
     let arg_path = env::args().nth(1);
@@ -47,12 +55,18 @@ fn main() {
     window.set_target_fps(60);
 
     let mut fb = Framebuffer::new(W, H);
+
+    let walk_cfg = WalkConfig::default();
+    let eye_offset = Vec3::new(0.0, EYE_HEIGHT - walk_cfg.radius, 0.0);
+    let start_body = if is_custom_obj {
+        Vec3::new(0.0, 1.5, 8.0)
+    } else {
+        Vec3::new(0.0, walk_cfg.radius, 4.2)
+    };
+    let mut walker = Walker::new(walk_cfg, start_body);
+
     let mut cam = Camera {
-        pos: if is_custom_obj {
-            Vec3::new(0.0, 1.5, 8.0)
-        } else {
-            Vec3::new(0.0, 1.8, 4.2)
-        },
+        pos: walker.pos + eye_offset,
         yaw: 0.0,
         pitch: -0.05,
         fov_y_rad: 68.0_f32.to_radians(),
@@ -68,13 +82,16 @@ fn main() {
         light_dir: Vec3::new(0.45, 0.82, 0.35).normalize(),
     };
 
+    let mut step_acc = 0.0_f32;
+    let mut jump_queued = false;
+
     let mut last = Instant::now();
     let mut elapsed = 0.0_f32;
     let mut fps_timer = 0.0_f32;
     let mut fps_frames = 0u32;
     let mut render_ms_acc = 0.0_f32;
 
-    println!("Controls: WASD move | Arrows/Q/E look | Space/Shift up/down | F1 sliver debug | F2 cycle threshold | F3 fog | Esc quit");
+    println!("Controls: WASD move | Space jump | Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | Esc quit");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -93,6 +110,16 @@ fn main() {
         if window.is_key_pressed(Key::F3, KeyRepeat::No) {
             cfg.fog_enabled = !cfg.fog_enabled;
         }
+        if window.is_key_pressed(Key::F4, KeyRepeat::No) {
+            let (_, _, forward) = cam.basis();
+            match raycast::raycast(&world_tris, cam.pos, forward, 100.0) {
+                Some((i, hit)) => println!(
+                    "Hit tri #{i} at {:.2} units (front face: {})",
+                    hit.t, hit.front_face
+                ),
+                None => println!("No hit"),
+            }
+        }
 
         // Camera rotation
         let turn_speed = 2.0 * dt;
@@ -109,30 +136,49 @@ fn main() {
             cam.pitch = (cam.pitch - turn_speed * 0.75).max(-1.35);
         }
 
-        // Horizontal and vertical movement
-        let move_speed = 5.5 * dt;
+        // Horizontal wish direction (normalized 0..=1)
         let (sy, cy) = cam.yaw.sin_cos();
         let fwd_xz = Vec3::new(sy, 0.0, -cy);
         let right_xz = Vec3::new(cy, 0.0, sy);
 
+        let mut wish = Vec3::ZERO;
         if window.is_key_down(Key::W) {
-            cam.pos = cam.pos + fwd_xz * move_speed;
+            wish = wish + fwd_xz;
         }
         if window.is_key_down(Key::S) {
-            cam.pos = cam.pos - fwd_xz * move_speed;
+            wish = wish - fwd_xz;
         }
         if window.is_key_down(Key::D) {
-            cam.pos = cam.pos + right_xz * move_speed;
+            wish = wish + right_xz;
         }
         if window.is_key_down(Key::A) {
-            cam.pos = cam.pos - right_xz * move_speed;
+            wish = wish - right_xz;
         }
-        if window.is_key_down(Key::Space) {
-            cam.pos.y += move_speed;
+        let wish_len = wish.len();
+        let wish_dir = if wish_len > 1e-6 {
+            wish * (1.0 / wish_len)
+        } else {
+            Vec3::ZERO
+        };
+
+        // Press-edge jump queued so it is never lost on fast frames or double-fired at 60 FPS
+        if window.is_key_pressed(Key::Space, KeyRepeat::No) {
+            jump_queued = true;
         }
-        if window.is_key_down(Key::LeftShift) {
-            cam.pos.y -= move_speed;
+
+        // Fixed-timestep walking physics.
+        // `dt` is already capped at 0.05 s at the top of the loop, so at most 6 ticks run per frame.
+        step_acc += dt;
+        while step_acc >= STEP {
+            step_acc -= STEP;
+            let jump = std::mem::take(&mut jump_queued);
+            walker.tick(&world_tris, STEP, wish_dir, jump);
+
+            // ---- FUTURE GAME HOOKS GO HERE (damage, audio events, shoulder bump, camera shake) ----
+            // Read `walker.contacts` inside this loop, once per physics tick.
         }
+
+        cam.pos = walker.pos + eye_offset;
 
         // Render pass
         let t_render = Instant::now();
