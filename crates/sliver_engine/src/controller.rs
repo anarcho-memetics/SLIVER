@@ -30,8 +30,11 @@ pub struct WalkConfig {
     pub gravity: f32,
     pub jump_speed: f32,
     pub max_speed: f32,
+    pub sprint_speed: f32,
     /// Horizontal acceleration on the ground.
     pub accel: f32,
+    /// Horizontal deceleration on the ground when no direction is pressed.
+    pub decel: f32,
     /// Horizontal acceleration in the air, applied only while a direction is pressed.
     pub air_accel: f32,
     /// Contacts with normal.y above this are walkable floor (0.7 is about 45 degrees).
@@ -54,7 +57,9 @@ impl Default for WalkConfig {
             gravity: 16.0,
             jump_speed: 4.6,
             max_speed: 5.5,
-            accel: 30.0,
+            sprint_speed: 21.5,
+            accel: 18.0,
+            decel: 40.0,
             air_accel: 3.0,
             walkable_normal_y: 0.7,
             max_step_height: 0.35,
@@ -166,6 +171,7 @@ fn vertical_snap(cfg: &WalkConfig, tris: &[Tri], pos: Vec3) -> Option<(Vec3, f32
 pub struct Walker {
     pub cfg: WalkConfig,
     /// Center of the body sphere (not the eye).
+    pub sprinting:bool,
     pub pos: Vec3,
     pub vel: Vec3,
     /// Ground state used for control (walk acceleration, jump).
@@ -189,6 +195,7 @@ impl Walker {
             pos,
             vel: Vec3::ZERO,
             grounded: false,
+            sprinting: false,
             contacts: Vec::new(),
             last_step_y: 0.0,
             prev_contacts: Vec::new(),
@@ -231,9 +238,15 @@ impl Walker {
         let wants_move = wish.x * wish.x + wish.z * wish.z > 1e-6;
         let horizontal = Vec3::new(self.vel.x, 0.0, self.vel.z);
         let horiz_speed_before = horizontal.len();
-        let target = Vec3::new(wish.x, 0.0, wish.z) * cfg.max_speed;
+        let top_speed = if self.sprinting {
+            cfg.sprint_speed
+        } else {
+            cfg.max_speed
+        };
+        let target = Vec3::new(wish.x, 0.0, wish.z) * top_speed;
         let h = if ground_like && !jumped {
-            accelerate_toward(horizontal, target, cfg.accel, dt)
+            let rate = if wants_move { cfg.accel } else { cfg.decel };
+            accelerate_toward(horizontal, target, rate, dt)
         } else if wants_move {
             accelerate_toward(horizontal, target, cfg.air_accel, dt)
         } else {
@@ -647,5 +660,22 @@ mod tests {
             }
         }
         assert!(bounced, "expected bounce off tall wall");
+    }
+    #[test]
+    fn sprinting_reaches_sprint_speed() {
+        let tris = flat_floor();
+        let cfg = WalkConfig::default();
+        let mut w = Walker::new(cfg, Vec3::new(0.0, cfg.radius, 0.0));
+        w.sprinting = true;
+        let wish = Vec3::new(1.0, 0.0, 0.0);
+
+        for _ in 0..80 {
+            w.tick(&tris, DT, wish, false);
+        }
+        assert!(
+            (w.vel.x - cfg.sprint_speed).abs() < 1e-3,
+            "sprint speed: {}",
+            w.vel.x
+        );
     }
 }

@@ -9,9 +9,9 @@ mod scene;
 mod view_bob;
 
 use controller::{WalkConfig, Walker};
-use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, Window, WindowOptions};
 use raster::{Camera, Framebuffer, RenderConfig};
-use scene::{build_demo_room, build_spinner, load_obj, tag_slivers};
+use scene::{build_demo_room, build_playground, build_spinner, load_obj, tag_slivers};
 use sliver_math::Vec3;
 use std::env;
 use std::path::Path;
@@ -24,6 +24,7 @@ const THRESHOLDS: [f32; 4] = [1.0, 5.0, 12.0, 25.0];
 
 const STEP: f32 = 1.0 / 120.0; // fixed physics timestep
 const EYE_HEIGHT: f32 = 1.65; // eye height above the floor
+const MOUSE_SENS: f32 = 0.0035;
 
 fn main() {
     let arg_path = env::args().nth(1);
@@ -90,6 +91,8 @@ fn main() {
 
     let mut step_acc = 0.0_f32;
     let mut jump_queued = false;
+    let mut in_playground = false;
+    let mut last_mouse: Option<(f32, f32)> = None;
 
     let mut last = Instant::now();
     let mut elapsed = 0.0_f32;
@@ -97,7 +100,7 @@ fn main() {
     let mut fps_frames = 0u32;
     let mut render_ms_acc = 0.0_f32;
 
-    println!("Controls: WASD move | Space jump | Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | Esc quit");
+    println!("Controls: WASD move | Shift sprint | Space jump | Mouse drag or Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | Esc quit");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -126,12 +129,42 @@ fn main() {
                 None => println!("No hit"),
             }
         }
+        if window.is_key_pressed(Key::F5, KeyRepeat::No) && !is_custom_obj {
+            in_playground = !in_playground;
+            world_tris = if in_playground {
+                build_playground()
+            } else {
+                build_demo_room()
+            };
+            sliver_count = tag_slivers(&mut world_tris, THRESHOLDS[thresh_idx]);
+            walker.pos = if in_playground {
+                Vec3::new(0.0, walk_cfg.radius, 25.0)
+            } else {
+                Vec3::new(0.0, walk_cfg.radius, 4.2)
+            };
+            walker.vel = Vec3::ZERO;
+            cfg.fog_end = if in_playground { 48.0 } else { 20.0 };
+        }
         // Jump is a press edge, consumed by the first physics tick that runs.
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
             jump_queued = true;
         }
 
-        // Camera rotation
+        // Camera rotation: mouse drag (LMB or RMB) + keyboard fallback
+        let mouse_look = window.get_mouse_down(MouseButton::Left)
+            || window.get_mouse_down(MouseButton::Right);
+        if mouse_look {
+            if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Pass) {
+                if let Some((lx, ly)) = last_mouse {
+                    cam.yaw += (mx - lx) * MOUSE_SENS;
+                    cam.pitch = (cam.pitch - (my - ly) * MOUSE_SENS).clamp(-1.35, 1.35);
+                }
+                last_mouse = Some((mx, my));
+            }
+        } else {
+            last_mouse = None;
+        }
+
         let turn_speed = 2.0 * dt;
         if window.is_key_down(Key::Left) || window.is_key_down(Key::Q) {
             cam.yaw -= turn_speed;
@@ -170,10 +203,10 @@ fn main() {
             Vec3::ZERO
         };
 
+        walker.sprinting =
+            window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+
         // Fixed-timestep physics.
-        // `dt` is already capped at 0.05 s where it is computed at the top of the loop, so at most
-        // 6 ticks run per frame and the accumulator cannot spiral. If that cap is ever removed,
-        // cap `dt` here before accumulating.
         step_acc += dt;
         while step_acc >= STEP {
             step_acc -= STEP;
@@ -183,11 +216,6 @@ fn main() {
 
             let speed = Vec3::new(walker.vel.x, 0.0, walker.vel.z).len();
             bob.tick(STEP, speed, walker.cfg.max_speed, walker.grounded, walker.last_step_y);
-
-            // ---- FUTURE GAME HOOKS GO HERE (damage, audio events, shoulder bump, camera shake) ----
-            // Read `walker.contacts` (fresh, impact_speed, tangent_velocity) and `walker.last_step_y`
-            // inside this loop, once per physics tick: they are overwritten on the next tick, so
-            // reading them after the loop at 60 FPS would lose `fresh` flags and peak impacts.
         }
 
         // The camera follows the body: eye offset + step smoothing + view bob.
@@ -195,12 +223,19 @@ fn main() {
         cam.pos = walker.pos + eye_offset + bob.offset(right);
 
         // Render pass
+        let (bob_yaw, bob_pitch) = bob.angles();
+        let render_cam = Camera {
+            yaw: cam.yaw + bob_yaw,
+            pitch: (cam.pitch + bob_pitch).clamp(-1.45, 1.45),
+            ..cam
+        };
+
         let t_render = Instant::now();
         fb.clear(cfg.fog_color);
-        let mut drawn = fb.draw_triangles(&world_tris, &cam, &cfg);
+        let mut drawn = fb.draw_triangles(&world_tris, &render_cam, &cfg);
         if !is_custom_obj {
             let spinner = build_spinner(elapsed * 1.1, Vec3::new(0.0, 2.5, -4.0));
-            drawn += fb.draw_triangles(&spinner, &cam, &cfg);
+            drawn += fb.draw_triangles(&spinner, &render_cam, &cfg);
         }
         render_ms_acc += t_render.elapsed().as_secs_f32() * 1000.0;
 

@@ -405,3 +405,66 @@ pub fn load_obj(path: &Path) -> Result<Vec<Tri>, String> {
     }
     Ok(tris)
 }
+
+/// Large 80x80 m test arena for high-speed sprinting, long stairs, jump gaps, and wall impacts.
+pub fn build_playground() -> Vec<Tri> {
+    let mut tris = Vec::new();
+
+    // Tiled floor (80x80 m in 10 m tiles) for clear visual speed reference.
+    for ix in -4..4 {
+        for iz in -4..4 {
+            let x0 = ix as f32 * 10.0;
+            let z0 = iz as f32 * 10.0;
+            let x1 = x0 + 10.0;
+            let z1 = z0 + 10.0;
+            let color = if (ix + iz) & 1 == 0 {
+                [76, 82, 92]
+            } else {
+                [66, 72, 82]
+            };
+            let a = Vec3::new(x0, 0.0, z0);
+            let b = Vec3::new(x0, 0.0, z1);
+            let c = Vec3::new(x1, 0.0, z1);
+            let d = Vec3::new(x1, 0.0, z0);
+            tris.push(Tri::new(a, b, c, color));
+            tris.push(Tri::new(a, c, d, color));
+        }
+    }
+
+    // Perimeter walls (height 6 m).
+    let wall_col = [95, 102, 114];
+    push_box(&mut tris, Vec3::new(-40.5, 0.0, -40.5), Vec3::new(40.5, 6.0, -40.0), wall_col);
+    push_box(&mut tris, Vec3::new(-40.5, 0.0, 40.0), Vec3::new(40.5, 6.0, 40.5), wall_col);
+    push_box(&mut tris, Vec3::new(-40.5, 0.0, -40.0), Vec3::new(-40.0, 6.0, 40.0), wall_col);
+    push_box(&mut tris, Vec3::new(40.0, 0.0, -40.0), Vec3::new(40.5, 6.0, 40.0), wall_col);
+
+    // Sprint runway markers along -Z (pillars every 10 m on both sides of the central lane).
+    for i in -3..=3 {
+        let z = i as f32 * 10.0;
+        push_box(&mut tris, Vec3::new(-6.0, 0.0, z - 0.3), Vec3::new(-5.4, 3.0, z + 0.3), [130, 140, 155]);
+        push_box(&mut tris, Vec3::new(5.4, 0.0, z - 0.3), Vec3::new(6.0, 3.0, z + 0.3), [130, 140, 155]);
+    }
+
+    // Long staircase (+X): 10 steps (0.45 m deep x 0.20 m high -> top at 2.0 m) + upper deck.
+    push_stairs(&mut tris, Vec3::new(8.0, 0.0, -4.0), 4.0, 10, 0.45, 0.20, [140, 150, 162]);
+    push_box(&mut tris, Vec3::new(12.5, 0.0, -4.0), Vec3::new(22.0, 2.0, 0.0), [122, 132, 146]);
+
+    // Jump gap course off the upper deck (+Z): gaps of 2.0 m, 3.2 m, and 4.5 m.
+    push_box(&mut tris, Vec3::new(14.0, 0.0, 2.0), Vec3::new(20.0, 2.0, 6.0), [122, 132, 146]);
+    push_box(&mut tris, Vec3::new(14.0, 0.0, 9.2), Vec3::new(20.0, 2.0, 13.2), [122, 132, 146]);
+    push_box(&mut tris, Vec3::new(14.0, 0.0, 17.7), Vec3::new(20.0, 2.0, 22.0), [122, 132, 146]);
+
+    // Obstacle test line on the west side (-X):
+    // 1) Climbable curb (0.20 m)
+    push_box(&mut tris, Vec3::new(-14.0, 0.0, -10.0), Vec3::new(-10.0, 0.20, -6.0), [110, 145, 120]);
+    // 2) Blocking ledge (0.55 m — above max_step_height, should stop without climbing)
+    push_box(&mut tris, Vec3::new(-14.0, 0.0, -2.0), Vec3::new(-10.0, 0.55, 2.0), [165, 130, 95]);
+    // 3) Tall impact wall (3.0 m — full sprint bounce test)
+    push_box(&mut tris, Vec3::new(-14.0, 0.0, 6.0), Vec3::new(-10.0, 3.0, 12.0), [160, 100, 100]);
+
+    // Low ceiling over a 0.20 m step (clearance 0.60 m: body of diameter 0.70 m cannot climb).
+    push_box(&mut tris, Vec3::new(-22.0, 0.0, -4.0), Vec3::new(-18.0, 0.20, 2.0), [135, 135, 150]);
+    push_box(&mut tris, Vec3::new(-22.0, 0.80, -4.0), Vec3::new(-18.0, 1.40, 2.0), [115, 115, 130]);
+
+    tris
+}
