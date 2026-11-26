@@ -7,10 +7,11 @@ use sliver_math::Vec3;
 pub struct ContactResponse {
     /// Coulomb friction coefficient (mu): tangential speed lost per unit of normal pressure.
     pub friction: f32,
-    /// Restitution (e): fraction of the normal impact speed returned as bounce.
+    /// Restitution (e): fraction of the impact speed ABOVE the threshold returned as bounce.
     pub restitution: f32,
     /// Minimum normal impact speed (s_n) for any bounce. Below it the surface does not bounce (no jitter).
     pub bounce_threshold: f32,
+    /// Upper limit of the bounce speed, so fast impacts cannot turn into a rubber ball.
     pub max_bounce: f32,
 }
 
@@ -27,27 +28,24 @@ pub fn accelerate_toward(vel: Vec3, target: Vec3, accel: f32, dt: f32) -> Vec3 {
 }
 
 /// Friction for SUSTAINED contacts, applied BEFORE `move_sphere` using the previous tick's contacts.
+/// `pick` chooses the response per contact (e.g. walkable floor vs wall).
 ///
 /// Only the tangential part is reduced (|v_t'| = max(0, |v_t| - mu * s_n)); the normal component is left
 /// intact so the sphere keeps pressing into the surface, the contact stays alive every tick and `fresh`
-/// does not flicker. Because this runs before the move, a push that stays inside the static friction cone
-/// produces no sideways displacement at all.
-pub fn pre_move_friction(v: Vec3, prev: &[Contact], p: &ContactResponse) -> Vec3 {
-    pre_move_friction_by(v, prev, |_| p)
-}
-
-pub fn pre_move_friction_by<'a, F>(mut v: Vec3, prev: &[Contact], mut pick: F) -> Vec3
-where
-    F: FnMut(&Contact) -> &'a ContactResponse,
-{
+/// does not flicker. Frictionless surfaces (mu = 0) are skipped.
+pub fn pre_move_friction_by<'a>(
+    mut v: Vec3,
+    prev: &[Contact],
+    pick: impl Fn(&Contact) -> &'a ContactResponse,
+) -> Vec3 {
     for c in prev {
-        let vn = v.dot(c.normal);
-        if vn >= 0.0 {
-            continue;
-        }
         let p = pick(c);
         if p.friction <= 0.0 {
             continue;
+        }
+        let vn = v.dot(c.normal);
+        if vn >= 0.0 {
+            continue; // not pressing into this surface
         }
         let s_n = -vn;
         let v_t = v - c.normal * vn;
@@ -61,20 +59,30 @@ where
     v
 }
 
-pub fn respond(v: Vec3, contacts: &[Contact], p: &ContactResponse) -> Vec3 {
-    respond_by(v, contacts, |_| p)
+/// Single-response convenience wrapper around [`pre_move_friction_by`].
+#[allow(dead_code)]
+pub fn pre_move_friction(v: Vec3, prev: &[Contact], p: &ContactResponse) -> Vec3 {
+    pre_move_friction_by(v, prev, |_| p)
 }
 
-pub fn respond_by<'a, F>(mut v: Vec3, contacts: &[Contact], mut pick: F) -> Vec3
-where
-    F: FnMut(&Contact) -> &'a ContactResponse,
-{
+/// Surface response applied AFTER `move_sphere`, per contact, using the live velocity so corners resolve
+/// consistently. With s_n = speed pressing into the surface and v_t = velocity parallel to it:
+///   - the normal component is removed for every contact;
+///   - friction |v_t'| = max(0, |v_t| - mu * s_n) is applied only to FRESH contacts (sustained contacts
+///     already got theirs in `pre_move_friction_by`, so friction is never applied twice);
+///   - bounce = min(e * (s_n - threshold), max_bounce) along the normal, only if s_n > threshold.
+/// Intended to run at a fixed timestep: s_n per tick depends on the tick length.
+pub fn respond_by<'a>(
+    mut v: Vec3,
+    contacts: &[Contact],
+    pick: impl Fn(&Contact) -> &'a ContactResponse,
+) -> Vec3 {
     for c in contacts {
+        let p = pick(c);
         let vn = v.dot(c.normal);
         if vn >= 0.0 {
-            continue;
+            continue; // already moving away from this surface
         }
-        let p = pick(c);
         let s_n = -vn;
         let mut out = v - c.normal * vn;
 
@@ -94,6 +102,12 @@ where
         v = out;
     }
     v
+}
+
+/// Single-response convenience wrapper around [`respond_by`].
+#[allow(dead_code)]
+pub fn respond(v: Vec3, contacts: &[Contact], p: &ContactResponse) -> Vec3 {
+    respond_by(v, contacts, |_| p)
 }
 
 #[cfg(test)]
@@ -119,7 +133,7 @@ mod tests {
             friction: 0.6,
             restitution: 0.25,
             bounce_threshold: threshold,
-            max_bounce: 10.0,
+            max_bounce: 1.0,
         }
     }
 
@@ -145,17 +159,29 @@ mod tests {
 
     #[test]
     fn sustained_contact_gets_no_friction_in_respond() {
-        // Friction for sustained contacts is pre_move_friction's job, so respond only cuts the normal part.
         let v = respond(Vec3::new(3.0, 0.0, -0.1), &[contact(WALL_N, false)], &params(100.0));
         assert!(close(v, Vec3::new(3.0, 0.0, 0.0)));
     }
 
     #[test]
-    fn bounce_only_above_threshold() {
-        let hard = respond(Vec3::new(0.0, 0.0, -4.0), &[contact(WALL_N, true)], &params(2.0));
-        assert!(close(hard, Vec3::new(0.0, 0.0, 0.5))); // e * s_n = 0.25 * 4
-        let soft = respond(Vec3::new(0.0, 0.0, -1.0), &[contact(WALL_N, true)], &params(2.0));
-        assert!(close(soft, Vec3::ZERO));
+    fn bounce_ramps_up_from_the_threshold() {
+        let wall = contact(WALL_N, true);
+        // At the threshold there is no bounce at all.
+        let v = respond(Vec3::new(0.0, 0.0, -2.0), &[wall], &params(2.0));
+        assert!(close(v, Vec3::ZERO));
+        // 0.4 above the threshold: e * 0.4 = 0.1.
+        let v = respond(Vec3::new(0.0, 0.0, -2.4), &[wall], &params(2.0));
+        assert!(close(v, Vec3::new(0.0, 0.0, 0.1)));
+        // 2.0 above the threshold: e * 2.0 = 0.5.
+        let v = respond(Vec3::new(0.0, 0.0, -4.0), &[wall], &params(2.0));
+        assert!(close(v, Vec3::new(0.0, 0.0, 0.5)));
+    }
+
+    #[test]
+    fn bounce_is_capped_by_max_bounce() {
+        // e * (10 - 2) = 2.0, capped at max_bounce = 1.0.
+        let v = respond(Vec3::new(0.0, 0.0, -10.0), &[contact(WALL_N, true)], &params(2.0));
+        assert!(close(v, Vec3::new(0.0, 0.0, 1.0)));
     }
 
     #[test]
@@ -167,12 +193,46 @@ mod tests {
 
     #[test]
     fn pre_move_friction_keeps_normal_velocity() {
-        // Inside the cone: tangential part is removed, normal part (pressing into the wall) is kept.
         let v = pre_move_friction(Vec3::new(0.1, 0.0, -0.5), &[contact(WALL_N, false)], &params(2.0));
         assert!(close(v, Vec3::new(0.0, 0.0, -0.5)));
-        // Outside the cone: only mu * s_n = 0.3 is lost.
         let v = pre_move_friction(Vec3::new(3.0, 0.0, -0.5), &[contact(WALL_N, false)], &params(2.0));
         assert!(close(v, Vec3::new(2.7, 0.0, -0.5)));
+    }
+
+    fn pick<'a>(
+        floor: &'a ContactResponse,
+        wall: &'a ContactResponse,
+        c: &Contact,
+    ) -> &'a ContactResponse {
+        if c.normal.y > 0.7 {
+            floor
+        } else {
+            wall
+        }
+    }
+
+    #[test]
+    fn per_surface_response_picks_params_per_contact() {
+        let floor = ContactResponse {
+            friction: 0.0,
+            restitution: 0.0,
+            bounce_threshold: f32::INFINITY,
+            max_bounce: 0.0,
+        };
+        let wall = params(100.0);
+        let up = Vec3::new(0.0, 1.0, 0.0);
+
+        // Landing: normal part removed, no bounce, sideways speed untouched.
+        let v = respond_by(Vec3::new(2.0, -6.0, 0.0), &[contact(up, true)], |c| pick(&floor, &wall, c));
+        assert!(close(v, Vec3::new(2.0, 0.0, 0.0)));
+
+        // Same kind of impact into a wall: Coulomb friction applies.
+        let v = respond_by(Vec3::new(0.5, 0.0, -4.0), &[contact(WALL_N, true)], |c| pick(&floor, &wall, c));
+        assert!(close(v, Vec3::ZERO));
+
+        // Sustained floor contact: no pre-move friction at all.
+        let v = pre_move_friction_by(Vec3::new(3.0, -0.1, 0.0), &[contact(up, false)], |c| pick(&floor, &wall, c));
+        assert!(close(v, Vec3::new(3.0, -0.1, 0.0)));
     }
 
     #[test]
@@ -209,7 +269,7 @@ mod tests {
             vel = respond(vel, &contacts, &p);
 
             if tick == 30 {
-                x_ref = pos.x; // approach and first impact are over by now
+                x_ref = pos.x;
             }
             if tick >= 30 {
                 assert_eq!(contacts.len(), 1, "contact must persist at tick {tick}");

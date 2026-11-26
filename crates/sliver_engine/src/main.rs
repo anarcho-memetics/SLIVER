@@ -6,6 +6,7 @@ mod motion;
 mod raster;
 mod raycast;
 mod scene;
+mod view_bob;
 
 use controller::{WalkConfig, Walker};
 use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
@@ -15,13 +16,14 @@ use sliver_math::Vec3;
 use std::env;
 use std::path::Path;
 use std::time::Instant;
+use view_bob::ViewBob;
 
 const W: usize = 960;
 const H: usize = 540;
 const THRESHOLDS: [f32; 4] = [1.0, 5.0, 12.0, 25.0];
 
 const STEP: f32 = 1.0 / 120.0; // fixed physics timestep
-const EYE_HEIGHT: f32 = 1.65;
+const EYE_HEIGHT: f32 = 1.65; // eye height above the floor
 
 fn main() {
     let arg_path = env::args().nth(1);
@@ -56,14 +58,18 @@ fn main() {
 
     let mut fb = Framebuffer::new(W, H);
 
+    // Body (sphere center) and camera are separate: the eye sits EYE_HEIGHT above the floor,
+    // i.e. (EYE_HEIGHT - radius) above the sphere center.
     let walk_cfg = WalkConfig::default();
     let eye_offset = Vec3::new(0.0, EYE_HEIGHT - walk_cfg.radius, 0.0);
-    let start_body = if is_custom_obj {
+    // A custom .obj has no guaranteed floor under this spot: the body falls until it finds one.
+    let body_start = if is_custom_obj {
         Vec3::new(0.0, 1.5, 8.0)
     } else {
         Vec3::new(0.0, walk_cfg.radius, 4.2)
     };
-    let mut walker = Walker::new(walk_cfg, start_body);
+    let mut walker = Walker::new(walk_cfg, body_start);
+    let mut bob = ViewBob::new();
 
     let mut cam = Camera {
         pos: walker.pos + eye_offset,
@@ -120,6 +126,10 @@ fn main() {
                 None => println!("No hit"),
             }
         }
+        // Jump is a press edge, consumed by the first physics tick that runs.
+        if window.is_key_pressed(Key::Space, KeyRepeat::No) {
+            jump_queued = true;
+        }
 
         // Camera rotation
         let turn_speed = 2.0 * dt;
@@ -136,11 +146,10 @@ fn main() {
             cam.pitch = (cam.pitch - turn_speed * 0.75).max(-1.35);
         }
 
-        // Horizontal wish direction (normalized 0..=1)
+        // Desired horizontal direction from input (length 0..=1)
         let (sy, cy) = cam.yaw.sin_cos();
         let fwd_xz = Vec3::new(sy, 0.0, -cy);
         let right_xz = Vec3::new(cy, 0.0, sy);
-
         let mut wish = Vec3::ZERO;
         if window.is_key_down(Key::W) {
             wish = wish + fwd_xz;
@@ -161,24 +170,29 @@ fn main() {
             Vec3::ZERO
         };
 
-        // Press-edge jump queued so it is never lost on fast frames or double-fired at 60 FPS
-        if window.is_key_pressed(Key::Space, KeyRepeat::No) {
-            jump_queued = true;
-        }
-
-        // Fixed-timestep walking physics.
-        // `dt` is already capped at 0.05 s at the top of the loop, so at most 6 ticks run per frame.
+        // Fixed-timestep physics.
+        // `dt` is already capped at 0.05 s where it is computed at the top of the loop, so at most
+        // 6 ticks run per frame and the accumulator cannot spiral. If that cap is ever removed,
+        // cap `dt` here before accumulating.
         step_acc += dt;
         while step_acc >= STEP {
             step_acc -= STEP;
-            let jump = std::mem::take(&mut jump_queued);
-            walker.tick(&world_tris, STEP, wish_dir, jump);
+
+            walker.tick(&world_tris, STEP, wish_dir, jump_queued);
+            jump_queued = false;
+
+            let speed = Vec3::new(walker.vel.x, 0.0, walker.vel.z).len();
+            bob.tick(STEP, speed, walker.cfg.max_speed, walker.grounded, walker.last_step_y);
 
             // ---- FUTURE GAME HOOKS GO HERE (damage, audio events, shoulder bump, camera shake) ----
-            // Read `walker.contacts` inside this loop, once per physics tick.
+            // Read `walker.contacts` (fresh, impact_speed, tangent_velocity) and `walker.last_step_y`
+            // inside this loop, once per physics tick: they are overwritten on the next tick, so
+            // reading them after the loop at 60 FPS would lose `fresh` flags and peak impacts.
         }
 
-        cam.pos = walker.pos + eye_offset;
+        // The camera follows the body: eye offset + step smoothing + view bob.
+        let (right, _, _) = cam.basis();
+        cam.pos = walker.pos + eye_offset + bob.offset(right);
 
         // Render pass
         let t_render = Instant::now();

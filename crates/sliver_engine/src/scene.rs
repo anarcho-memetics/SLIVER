@@ -107,6 +107,28 @@ fn push_box(out: &mut Vec<Tri>, min: Vec3, max: Vec3, color: [u8; 3]) {
     );
 }
 
+/// Appends a straight staircase rising toward +X: `steps` treads, each `tread` deep and `rise` higher
+/// than the previous one. Each step is a solid box from the floor up, so there are no gaps under treads.
+fn push_stairs(
+    out: &mut Vec<Tri>,
+    origin: Vec3,
+    width_z: f32,
+    steps: usize,
+    tread: f32,
+    rise: f32,
+    color: [u8; 3],
+) {
+    for i in 0..steps {
+        let x0 = origin.x + i as f32 * tread;
+        push_box(
+            out,
+            Vec3::new(x0, origin.y, origin.z),
+            Vec3::new(x0 + tread, origin.y + rise * (i + 1) as f32, origin.z + width_z),
+            color,
+        );
+    }
+}
+
 /// Appends an enclosed room with inward-facing normals.
 fn push_room(
     out: &mut Vec<Tri>,
@@ -244,6 +266,18 @@ pub fn build_demo_room() -> Vec<Tri> {
         Vec3::new(-0.9, 0.0, -4.9),
         Vec3::new(0.9, 1.0, -3.1),
         [138, 148, 160],
+    );
+    // Test staircase on the east side: 5 steps, 0.40 m deep and 0.20 m high each (top at 1.0 m).
+    // It sits at x 3.4..5.4, z 1.2..2.8: clear of the pillars, the platform and every coordinate used
+    // by the existing collision, controller and raycast tests.
+    push_stairs(
+        &mut tris,
+        Vec3::new(3.4, 0.0, 1.2),
+        1.6,
+        5,
+        0.4,
+        0.2,
+        [140, 150, 162],
     );
 
     // --- Intentional slivers to verify sliver_math live detection (F1 / F2) ---
