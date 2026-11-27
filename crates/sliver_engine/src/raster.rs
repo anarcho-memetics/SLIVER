@@ -1,13 +1,14 @@
 use crate::scene::{Texture, Tri, NO_TEX};
 use sliver_math::Vec3;
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 /// Perspective-correct texture span length in pixels (Quake-style 16 px subdivision).
 const SPAN_SIZE: usize = 16;
 const INV_SPAN_SIZE: f32 = 1.0 / SPAN_SIZE as f32;
-/// Minimum projected triangle count before spawning worker bands.
+/// Minimum projected triangle count before waking worker bands.
 const MT_TRI_THRESHOLD: usize = 16;
-/// Cap worker threads to keep band sizes L2-friendly and avoid Windows spawn overhead.
+/// Cap total threads (main + persistent workers) to keep band sizes L2-friendly.
 const MAX_THREADS: usize = 8;
 
 pub struct Camera {
@@ -117,13 +118,244 @@ struct Band<'a> {
     y0: usize,
 }
 
+struct WorkerBuf {
+    color: Vec<u32>,
+    inv_z: Vec<f32>,
+    px_start: usize,
+    px_end: usize,
+}
+
+struct PoolJob {
+    generation: u64,
+    projected: Arc<Vec<ProjectedTri>>,
+    textures: Arc<Vec<Texture>>,
+    fog: FogParams,
+    clear_packed: Option<u32>,
+}
+
+struct PoolState {
+    job: Option<PoolJob>,
+    remaining: usize,
+    shutdown: bool,
+}
+
+struct PoolShared {
+    state: Mutex<PoolState>,
+    work_cv: Condvar,
+    done_cv: Condvar,
+}
+
+struct BandPool {
+    num_threads: usize,
+    width: usize,
+    band0_px: usize,
+    generation: u64,
+    shared: Arc<PoolShared>,
+    worker_bufs: Vec<Arc<Mutex<WorkerBuf>>>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl BandPool {
+    fn new(num_threads: usize, width: usize, height: usize) -> Self {
+        let rows_per_band = height.div_ceil(num_threads);
+        let band0_rows = height.min(rows_per_band);
+        let band0_px = band0_rows * width;
+
+        let shared = Arc::new(PoolShared {
+            state: Mutex::new(PoolState {
+                job: None,
+                remaining: 0,
+                shutdown: false,
+            }),
+            work_cv: Condvar::new(),
+            done_cv: Condvar::new(),
+        });
+
+        let mut worker_bufs = Vec::new();
+        let mut handles = Vec::new();
+
+        let mut band_idx = 1usize;
+        while band_idx * rows_per_band < height {
+            let band_y0 = band_idx * rows_per_band;
+            let band_rows = (height - band_y0).min(rows_per_band);
+            let px_start = band_y0 * width;
+            let px_len = band_rows * width;
+
+            let buf = Arc::new(Mutex::new(WorkerBuf {
+                color: vec![0; px_len],
+                inv_z: vec![0.0; px_len],
+                px_start,
+                px_end: px_start + px_len,
+            }));
+            worker_bufs.push(Arc::clone(&buf));
+
+            let shared_w = Arc::clone(&shared);
+            let handle = thread::spawn(move || {
+                let mut last_gen = 0u64;
+                loop {
+                    let (projected, textures, fog, clear_packed) = {
+                        let mut guard = shared_w.state.lock().unwrap();
+                        while !guard.shutdown
+                            && guard
+                                .job
+                                .as_ref()
+                                .is_none_or(|j| j.generation == last_gen)
+                        {
+                            guard = shared_w.work_cv.wait(guard).unwrap();
+                        }
+                        if guard.shutdown {
+                            break;
+                        }
+                        let j = guard.job.as_ref().unwrap();
+                        last_gen = j.generation;
+                        (
+                            Arc::clone(&j.projected),
+                            Arc::clone(&j.textures),
+                            j.fog,
+                            j.clear_packed,
+                        )
+                    };
+
+                    {
+                        let mut b = buf.lock().unwrap();
+                        let wb = &mut *b;
+                        if let Some(packed) = clear_packed {
+                            wb.color.fill(packed);
+                            wb.inv_z.fill(0.0);
+                        }
+                        let mut band = Band {
+                            color: &mut wb.color,
+                            inv_z: &mut wb.inv_z,
+                            width,
+                            y0: band_y0,
+                        };
+                        rasterize_band(&mut band, &projected, &textures, fog);
+                    }
+
+                    // Drop Arc clones before signaling done so main thread's Arc::get_mut succeeds.
+                    drop(projected);
+                    drop(textures);
+
+                    let mut guard = shared_w.state.lock().unwrap();
+                    guard.remaining -= 1;
+                    if guard.remaining == 0 {
+                        shared_w.done_cv.notify_one();
+                    }
+                }
+            });
+            handles.push(handle);
+            band_idx += 1;
+        }
+
+        Self {
+            num_threads,
+            width,
+            band0_px,
+            generation: 0,
+            shared,
+            worker_bufs,
+            handles,
+        }
+    }
+
+    fn dispatch(
+        &mut self,
+        color: &mut [u32],
+        inv_z: &mut [f32],
+        projected: &Arc<Vec<ProjectedTri>>,
+        textures: &Arc<Vec<Texture>>,
+        fog: FogParams,
+        clear_packed: Option<u32>,
+    ) {
+        let n_workers = self.worker_bufs.len();
+        if n_workers == 0 {
+            let mut band = Band {
+                color,
+                inv_z,
+                width: self.width,
+                y0: 0,
+            };
+            rasterize_band(&mut band, projected, textures, fog);
+            return;
+        }
+
+        if clear_packed.is_none() {
+            for wb in &self.worker_bufs {
+                let mut b = wb.lock().unwrap();
+                let (s, e) = (b.px_start, b.px_end);
+                b.color.copy_from_slice(&color[s..e]);
+                b.inv_z.copy_from_slice(&inv_z[s..e]);
+            }
+        }
+
+        self.generation = self.generation.wrapping_add(1).max(1);
+        {
+            let mut guard = self.shared.state.lock().unwrap();
+            guard.job = Some(PoolJob {
+                generation: self.generation,
+                projected: Arc::clone(projected),
+                textures: Arc::clone(textures),
+                fog,
+                clear_packed,
+            });
+            guard.remaining = n_workers;
+            self.shared.work_cv.notify_all();
+        }
+
+        // Main thread renders band 0 directly in place.
+        {
+            let mut band0 = Band {
+                color: &mut color[..self.band0_px],
+                inv_z: &mut inv_z[..self.band0_px],
+                width: self.width,
+                y0: 0,
+            };
+            rasterize_band(&mut band0, projected, textures, fog);
+        }
+
+        // Wait for all workers and drop the job's Arc clones.
+        {
+            let mut guard = self.shared.state.lock().unwrap();
+            while guard.remaining > 0 {
+                guard = self.shared.done_cv.wait(guard).unwrap();
+            }
+            guard.job = None;
+        }
+
+        for wb in &self.worker_bufs {
+            let b = wb.lock().unwrap();
+            let (s, e) = (b.px_start, b.px_end);
+            color[s..e].copy_from_slice(&b.color);
+            inv_z[s..e].copy_from_slice(&b.inv_z);
+        }
+    }
+}
+
+impl Drop for BandPool {
+    fn drop(&mut self) {
+        {
+            let mut guard = self.shared.state.lock().unwrap();
+            guard.shutdown = true;
+            guard.job = None;
+            self.shared.work_cv.notify_all();
+        }
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct Framebuffer {
     pub width: usize,
     pub height: usize,
     pub color: Vec<u32>,
     pub inv_z: Vec<f32>,
-    projected: Vec<ProjectedTri>,
+    projected: Arc<Vec<ProjectedTri>>,
+    tex_cache_key: (usize, usize),
+    tex_cache: Arc<Vec<Texture>>,
+    clean_clear: Option<u32>,
     num_threads: usize,
+    pool: Option<BandPool>,
 }
 
 impl Framebuffer {
@@ -137,8 +369,12 @@ impl Framebuffer {
             height,
             color: vec![0; width * height],
             inv_z: vec![0.0; width * height],
-            projected: Vec::with_capacity(1024),
+            projected: Arc::new(Vec::with_capacity(1024)),
+            tex_cache_key: (0, 0),
+            tex_cache: Arc::new(Vec::new()),
+            clean_clear: None,
             num_threads,
+            pool: None,
         }
     }
 
@@ -146,6 +382,16 @@ impl Framebuffer {
         let packed = pack_rgb(rgb[0], rgb[1], rgb[2]);
         self.color.fill(packed);
         self.inv_z.fill(0.0);
+        self.clean_clear = Some(packed);
+    }
+
+    fn cached_textures(&mut self, textures: &[Texture]) -> Arc<Vec<Texture>> {
+        let key = (textures.as_ptr() as usize, textures.len());
+        if key != self.tex_cache_key {
+            self.tex_cache = Arc::new(textures.to_vec());
+            self.tex_cache_key = key;
+        }
+        Arc::clone(&self.tex_cache)
     }
 
     pub fn draw_triangles(
@@ -186,7 +432,8 @@ impl Framebuffer {
         };
 
         // Phase 1: cull, clip against near plane, shade, and project into a reusable buffer.
-        self.projected.clear();
+        let projected_vec = Arc::make_mut(&mut self.projected);
+        projected_vec.clear();
         for tri in tris {
             let n = tri.normal();
             // World-space backface culling
@@ -249,56 +496,52 @@ impl Framebuffer {
                 if let Some(proj) =
                     project_tri(c.0, c.1, c.2, &pctx, tex_id, shade256, solid_packed)
                 {
-                    self.projected.push(proj);
+                    projected_vec.push(proj);
                 }
             }
         }
 
-        let drawn = self.projected.len();
+        let drawn = projected_vec.len();
         if drawn == 0 {
             return 0;
         }
 
         // Front-to-back sort (largest 1/z sum first) so nearer walls reject background overdraw.
-        self.projected
-            .sort_unstable_by(|a, b| b.sort_iz.total_cmp(&a.sort_iz));
+        projected_vec.sort_unstable_by(|a, b| b.sort_iz.total_cmp(&a.sort_iz));
 
-        // Phase 2: rasterize horizontal bands in parallel across CPU cores.
+        // Phase 2: rasterize horizontal bands in parallel using the persistent thread pool.
         let width = self.width;
         let height = self.height;
-        let projected = &self.projected;
         let n_threads = self.num_threads.min(height);
+        let clear_packed = self.clean_clear.take();
 
         if n_threads <= 1 || drawn < MT_TRI_THRESHOLD {
             let mut band = Band {
                 color: &mut self.color,
                 inv_z: &mut self.inv_z,
-                width,
+                width: self.width,
                 y0: 0,
             };
-            rasterize_band(&mut band, projected, textures, fog);
+            rasterize_band(&mut band, &self.projected, textures, fog);
         } else {
-            let rows_per_band = height.div_ceil(n_threads);
-            let pixels_per_band = rows_per_band * width;
-            let color_chunks = self.color.chunks_mut(pixels_per_band);
-            let inv_z_chunks = self.inv_z.chunks_mut(pixels_per_band);
-
-            thread::scope(|scope| {
-                for (band_idx, (color_band, inv_z_band)) in
-                    color_chunks.zip(inv_z_chunks).enumerate()
-                {
-                    let band_y0 = band_idx * rows_per_band;
-                    scope.spawn(move || {
-                        let mut band = Band {
-                            color: color_band,
-                            inv_z: inv_z_band,
-                            width,
-                            y0: band_y0,
-                        };
-                        rasterize_band(&mut band, projected, textures, fog);
-                    });
-                }
-            });
+            let tex_arc = self.cached_textures(textures);
+            let need_init = self
+                .pool
+                .as_ref()
+                .is_none_or(|p| p.num_threads != n_threads);
+            if need_init {
+                self.pool = Some(BandPool::new(n_threads, width, height));
+            }
+            if let Some(pool) = self.pool.as_mut() {
+                pool.dispatch(
+                    &mut self.color,
+                    &mut self.inv_z,
+                    &self.projected,
+                    &tex_arc,
+                    fog,
+                    clear_packed,
+                );
+            }
         }
 
         drawn
