@@ -14,6 +14,7 @@ const SAME_PLANE_COS: f32 = 0.985;
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
     /// Triangle that produced the deepest penetration for this plane.
+    #[allow(dead_code)]
     pub tri: usize,
     /// Unit normal pointing from the surface toward the sphere.
     pub normal: Vec3,
@@ -24,6 +25,7 @@ pub struct Contact {
     /// s_n = -min(0, dot(v, n)): speed pressing into the surface.
     pub impact_speed: f32,
     /// v_t = v - dot(v, n) * n: velocity parallel to the surface.
+    #[allow(dead_code)]
     pub tangent_velocity: Vec3,
     /// True if no contact with a similar normal existed in the previous move.
     pub fresh: bool,
@@ -53,7 +55,10 @@ fn record(out: &mut Vec<Contact>, tri: usize, c: &SphereContact, vel: Vec3) {
         tangent_velocity: vel - c.normal * vn,
         fresh: false,
     };
-    if let Some(e) = out.iter_mut().find(|e| e.normal.dot(c.normal) > SAME_PLANE_COS) {
+    if let Some(e) = out
+        .iter_mut()
+        .find(|e| e.normal.dot(c.normal) > SAME_PLANE_COS)
+    {
         if contact.depth > e.depth {
             *e = contact;
         }

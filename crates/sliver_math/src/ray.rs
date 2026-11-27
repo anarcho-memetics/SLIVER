@@ -76,8 +76,15 @@ mod tests {
     #[test]
     fn hits_floor_from_above() {
         let (a, b, c) = floor();
-        let hit = ray_triangle(Vec3::new(0.3, 2.0, 0.6), Vec3::new(0.0, -1.0, 0.0), a, b, c, 100.0)
-            .expect("should hit");
+        let hit = ray_triangle(
+            Vec3::new(0.3, 2.0, 0.6),
+            Vec3::new(0.0, -1.0, 0.0),
+            a,
+            b,
+            c,
+            100.0,
+        )
+        .expect("should hit");
         assert!((hit.t - 2.0).abs() < 1e-5);
         assert!(hit.front_face);
     }
@@ -85,8 +92,15 @@ mod tests {
     #[test]
     fn hits_floor_from_below_as_back_face() {
         let (a, b, c) = floor();
-        let hit = ray_triangle(Vec3::new(0.3, -1.0, 0.6), Vec3::new(0.0, 1.0, 0.0), a, b, c, 100.0)
-            .expect("should hit");
+        let hit = ray_triangle(
+            Vec3::new(0.3, -1.0, 0.6),
+            Vec3::new(0.0, 1.0, 0.0),
+            a,
+            b,
+            c,
+            100.0,
+        )
+        .expect("should hit");
         assert!((hit.t - 1.0).abs() < 1e-5);
         assert!(!hit.front_face);
     }
@@ -94,22 +108,54 @@ mod tests {
     #[test]
     fn misses_outside_triangle() {
         let (a, b, c) = floor();
-        assert!(ray_triangle(Vec3::new(0.8, 2.0, 0.2), Vec3::new(0.0, -1.0, 0.0), a, b, c, 100.0).is_none());
+        assert!(ray_triangle(
+            Vec3::new(0.8, 2.0, 0.2),
+            Vec3::new(0.0, -1.0, 0.0),
+            a,
+            b,
+            c,
+            100.0
+        )
+        .is_none());
     }
 
     #[test]
     fn respects_t_max_and_direction() {
         let (a, b, c) = floor();
         // Too far for t_max.
-        assert!(ray_triangle(Vec3::new(0.3, 2.0, 0.6), Vec3::new(0.0, -1.0, 0.0), a, b, c, 1.0).is_none());
+        assert!(ray_triangle(
+            Vec3::new(0.3, 2.0, 0.6),
+            Vec3::new(0.0, -1.0, 0.0),
+            a,
+            b,
+            c,
+            1.0
+        )
+        .is_none());
         // Triangle is behind the origin.
-        assert!(ray_triangle(Vec3::new(0.3, -2.0, 0.6), Vec3::new(0.0, -1.0, 0.0), a, b, c, 100.0).is_none());
+        assert!(ray_triangle(
+            Vec3::new(0.3, -2.0, 0.6),
+            Vec3::new(0.0, -1.0, 0.0),
+            a,
+            b,
+            c,
+            100.0
+        )
+        .is_none());
     }
 
     #[test]
     fn parallel_ray_misses() {
         let (a, b, c) = floor();
-        assert!(ray_triangle(Vec3::new(0.3, 1.0, 0.6), Vec3::new(1.0, 0.0, 0.0), a, b, c, 100.0).is_none());
+        assert!(ray_triangle(
+            Vec3::new(0.3, 1.0, 0.6),
+            Vec3::new(1.0, 0.0, 0.0),
+            a,
+            b,
+            c,
+            100.0
+        )
+        .is_none());
     }
 
     #[test]
@@ -118,8 +164,15 @@ mod tests {
         let a = Vec3::new(0.0, 0.0, 0.0);
         let b = Vec3::new(15.6, 0.0, 0.0);
         let c = Vec3::new(15.6, 0.14, 0.0);
-        let hit = ray_triangle(Vec3::new(10.0, 0.05, 1.0), Vec3::new(0.0, 0.0, -1.0), a, b, c, 100.0)
-            .expect("should hit the sliver");
+        let hit = ray_triangle(
+            Vec3::new(10.0, 0.05, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            a,
+            b,
+            c,
+            100.0,
+        )
+        .expect("should hit the sliver");
         assert!((hit.t - 1.0).abs() < 1e-4);
     }
 }

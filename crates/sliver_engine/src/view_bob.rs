@@ -82,7 +82,8 @@ impl ViewBob {
         };
         self.prev_speed = speed;
         let target_accel_pitch = raw_accel * ACCEL_PITCH_GAIN;
-        self.accel_pitch += (target_accel_pitch - self.accel_pitch) * (1.0 - (-dt / ACCEL_TAU).exp());
+        self.accel_pitch +=
+            (target_accel_pitch - self.accel_pitch) * (1.0 - (-dt / ACCEL_TAU).exp());
 
         // Fast step-up stumble: starts at 0 (no tick-0 pop), dips slightly, then recovers smoothly.
         if last_step_y > 0.0 {
@@ -140,7 +141,10 @@ mod tests {
     fn step_up_starts_below_and_settles_to_zero() {
         let mut b = ViewBob::new();
         b.tick(DT, 0.0, 5.5, true, 0.20);
-        assert!(b.offset(Vec3::new(1.0, 0.0, 0.0)).y < -0.15, "camera must lag below the new height");
+        assert!(
+            b.offset(Vec3::new(1.0, 0.0, 0.0)).y < -0.15,
+            "camera must lag below the new height"
+        );
         for _ in 0..60 {
             b.tick(DT, 0.0, 5.5, true, 0.0);
         }

@@ -71,6 +71,7 @@ pub fn pre_move_friction(v: Vec3, prev: &[Contact], p: &ContactResponse) -> Vec3
 ///   - friction |v_t'| = max(0, |v_t| - mu * s_n) is applied only to FRESH contacts (sustained contacts
 ///     already got theirs in `pre_move_friction_by`, so friction is never applied twice);
 ///   - bounce = min(e * (s_n - threshold), max_bounce) along the normal, only if s_n > threshold.
+///
 /// Intended to run at a fixed timestep: s_n per tick depends on the tick length.
 pub fn respond_by<'a>(
     mut v: Vec3,
@@ -146,20 +147,32 @@ mod tests {
     #[test]
     fn head_on_impact_stops_sideways_motion() {
         // s_n = 4, v_t = 0.5: friction 0.6 * 4 = 2.4 > 0.5, so no sideways push remains.
-        let v = respond(Vec3::new(0.5, 0.0, -4.0), &[contact(WALL_N, true)], &params(100.0));
+        let v = respond(
+            Vec3::new(0.5, 0.0, -4.0),
+            &[contact(WALL_N, true)],
+            &params(100.0),
+        );
         assert!(close(v, Vec3::ZERO));
     }
 
     #[test]
     fn grazing_contact_barely_slows() {
         // s_n = 0.1, v_t = 3: loses 0.6 * 0.1 = 0.06.
-        let v = respond(Vec3::new(3.0, 0.0, -0.1), &[contact(WALL_N, true)], &params(100.0));
+        let v = respond(
+            Vec3::new(3.0, 0.0, -0.1),
+            &[contact(WALL_N, true)],
+            &params(100.0),
+        );
         assert!(close(v, Vec3::new(2.94, 0.0, 0.0)));
     }
 
     #[test]
     fn sustained_contact_gets_no_friction_in_respond() {
-        let v = respond(Vec3::new(3.0, 0.0, -0.1), &[contact(WALL_N, false)], &params(100.0));
+        let v = respond(
+            Vec3::new(3.0, 0.0, -0.1),
+            &[contact(WALL_N, false)],
+            &params(100.0),
+        );
         assert!(close(v, Vec3::new(3.0, 0.0, 0.0)));
     }
 
@@ -180,7 +193,11 @@ mod tests {
     #[test]
     fn bounce_is_capped_by_max_bounce() {
         // e * (10 - 2) = 2.0, capped at max_bounce = 1.0.
-        let v = respond(Vec3::new(0.0, 0.0, -10.0), &[contact(WALL_N, true)], &params(2.0));
+        let v = respond(
+            Vec3::new(0.0, 0.0, -10.0),
+            &[contact(WALL_N, true)],
+            &params(2.0),
+        );
         assert!(close(v, Vec3::new(0.0, 0.0, 1.0)));
     }
 
@@ -188,14 +205,25 @@ mod tests {
     fn moving_away_is_untouched() {
         let v = Vec3::new(1.0, 0.0, 2.0);
         assert!(close(respond(v, &[contact(WALL_N, true)], &params(2.0)), v));
-        assert!(close(pre_move_friction(v, &[contact(WALL_N, false)], &params(2.0)), v));
+        assert!(close(
+            pre_move_friction(v, &[contact(WALL_N, false)], &params(2.0)),
+            v
+        ));
     }
 
     #[test]
     fn pre_move_friction_keeps_normal_velocity() {
-        let v = pre_move_friction(Vec3::new(0.1, 0.0, -0.5), &[contact(WALL_N, false)], &params(2.0));
+        let v = pre_move_friction(
+            Vec3::new(0.1, 0.0, -0.5),
+            &[contact(WALL_N, false)],
+            &params(2.0),
+        );
         assert!(close(v, Vec3::new(0.0, 0.0, -0.5)));
-        let v = pre_move_friction(Vec3::new(3.0, 0.0, -0.5), &[contact(WALL_N, false)], &params(2.0));
+        let v = pre_move_friction(
+            Vec3::new(3.0, 0.0, -0.5),
+            &[contact(WALL_N, false)],
+            &params(2.0),
+        );
         assert!(close(v, Vec3::new(2.7, 0.0, -0.5)));
     }
 
@@ -223,15 +251,21 @@ mod tests {
         let up = Vec3::new(0.0, 1.0, 0.0);
 
         // Landing: normal part removed, no bounce, sideways speed untouched.
-        let v = respond_by(Vec3::new(2.0, -6.0, 0.0), &[contact(up, true)], |c| pick(&floor, &wall, c));
+        let v = respond_by(Vec3::new(2.0, -6.0, 0.0), &[contact(up, true)], |c| {
+            pick(&floor, &wall, c)
+        });
         assert!(close(v, Vec3::new(2.0, 0.0, 0.0)));
 
         // Same kind of impact into a wall: Coulomb friction applies.
-        let v = respond_by(Vec3::new(0.5, 0.0, -4.0), &[contact(WALL_N, true)], |c| pick(&floor, &wall, c));
+        let v = respond_by(Vec3::new(0.5, 0.0, -4.0), &[contact(WALL_N, true)], |c| {
+            pick(&floor, &wall, c)
+        });
         assert!(close(v, Vec3::ZERO));
 
         // Sustained floor contact: no pre-move friction at all.
-        let v = pre_move_friction_by(Vec3::new(3.0, -0.1, 0.0), &[contact(up, false)], |c| pick(&floor, &wall, c));
+        let v = pre_move_friction_by(Vec3::new(3.0, -0.1, 0.0), &[contact(up, false)], |c| {
+            pick(&floor, &wall, c)
+        });
         assert!(close(v, Vec3::new(3.0, -0.1, 0.0)));
     }
 
@@ -273,10 +307,17 @@ mod tests {
             }
             if tick >= 30 {
                 assert_eq!(contacts.len(), 1, "contact must persist at tick {tick}");
-                assert!(!contacts[0].fresh, "contact must stay sustained at tick {tick}");
+                assert!(
+                    !contacts[0].fresh,
+                    "contact must stay sustained at tick {tick}"
+                );
             }
         }
-        assert!((pos.x - x_ref).abs() < 1e-4, "tangential drift: {}", pos.x - x_ref);
+        assert!(
+            (pos.x - x_ref).abs() < 1e-4,
+            "tangential drift: {}",
+            pos.x - x_ref
+        );
         assert!((pos.z - (-10.0 + R)).abs() < 1e-3);
     }
 }

@@ -57,7 +57,7 @@ impl Default for WalkConfig {
             gravity: 16.0,
             jump_speed: 4.6,
             max_speed: 5.5,
-            sprint_speed: 21.5,
+            sprint_speed: 9.5,
             accel: 18.0,
             decel: 40.0,
             air_accel: 3.0,
@@ -119,7 +119,15 @@ fn try_step_up(
     let mut scratch: Vec<Contact> = Vec::new();
 
     // 1) up (a low ceiling stops it by itself)
-    let up = move_sphere(tris, start, cfg.radius, Vec3::new(0.0, cfg.max_step_height, 0.0), 1.0, &[], &mut scratch);
+    let up = move_sphere(
+        tris,
+        start,
+        cfg.radius,
+        Vec3::new(0.0, cfg.max_step_height, 0.0),
+        1.0,
+        &[],
+        &mut scratch,
+    );
     let raised = up.y - start.y;
     if raised < MIN_STEP_GAIN {
         return None;
@@ -134,7 +142,15 @@ fn try_step_up(
     }
 
     // 3) down (a little extra so a flat surface registers as a contact)
-    let down = move_sphere(tris, fwd, cfg.radius, Vec3::new(0.0, -(raised + 0.02), 0.0), 1.0, &[], &mut scratch);
+    let down = move_sphere(
+        tris,
+        fwd,
+        cfg.radius,
+        Vec3::new(0.0, -(raised + 0.02), 0.0),
+        1.0,
+        &[],
+        &mut scratch,
+    );
     let gain = down.y - start.y;
     if gain < MIN_STEP_GAIN || gain > cfg.max_step_height + 1e-3 {
         return None;
@@ -155,9 +171,20 @@ fn try_step_up(
 /// Pure vertical snap down onto a walkable surface.
 fn vertical_snap(cfg: &WalkConfig, tris: &[Tri], pos: Vec3) -> Option<(Vec3, f32, Vec<Contact>)> {
     let mut c: Vec<Contact> = Vec::new();
-    let p = move_sphere(tris, pos, cfg.radius, Vec3::new(0.0, -cfg.max_step_height, 0.0), 1.0, &[], &mut c);
+    let p = move_sphere(
+        tris,
+        pos,
+        cfg.radius,
+        Vec3::new(0.0, -cfg.max_step_height, 0.0),
+        1.0,
+        &[],
+        &mut c,
+    );
     let drop = pos.y - p.y;
-    if horizontal_len(pos, p) < 0.01 && drop > MIN_STEP_GAIN && c.iter().any(|k| k.normal.y > cfg.walkable_normal_y) {
+    if horizontal_len(pos, p) < 0.01
+        && drop > MIN_STEP_GAIN
+        && c.iter().any(|k| k.normal.y > cfg.walkable_normal_y)
+    {
         for k in c.iter_mut() {
             k.fresh = false;
             k.impact_speed = 0.0;
@@ -171,8 +198,8 @@ fn vertical_snap(cfg: &WalkConfig, tris: &[Tri], pos: Vec3) -> Option<(Vec3, f32
 pub struct Walker {
     pub cfg: WalkConfig,
     /// Center of the body sphere (not the eye).
-    pub sprinting:bool,
     pub pos: Vec3,
+    pub sprinting: bool,
     pub vel: Vec3,
     /// Ground state used for control (walk acceleration, jump).
     pub grounded: bool,
@@ -245,7 +272,12 @@ impl Walker {
         };
         let target = Vec3::new(wish.x, 0.0, wish.z) * top_speed;
         let h = if ground_like && !jumped {
-            let rate = if wants_move { cfg.accel } else { cfg.decel };
+            let reversing = wants_move && horizontal.dot(target) < 0.0;
+            let rate = if !wants_move || reversing {
+                cfg.decel
+            } else {
+                cfg.accel
+            };
             accelerate_toward(horizontal, target, rate, dt)
         } else if wants_move {
             accelerate_toward(horizontal, target, cfg.air_accel, dt)
@@ -273,13 +305,19 @@ impl Walker {
             &self.prev_contacts,
             &mut self.contacts,
         );
-        let supported_now = self.contacts.iter().any(|c| c.normal.y > cfg.walkable_normal_y);
+        let supported_now = self
+            .contacts
+            .iter()
+            .any(|c| c.normal.y > cfg.walkable_normal_y);
 
         // Static edge grip: standing still on a step edge must not roll the sphere off the ledge.
         if !wants_move
             && !jumped
             && horiz_speed_before < EDGE_GRIP_MAX_SPEED
-            && self.contacts.iter().any(|c| c.normal.y > EDGE_GRIP_MIN_NORMAL_Y && c.normal.y < 0.99)
+            && self
+                .contacts
+                .iter()
+                .any(|c| c.normal.y > EDGE_GRIP_MIN_NORMAL_Y && c.normal.y < 0.99)
         {
             self.pos = start;
             self.vel = Vec3::ZERO;
@@ -303,7 +341,8 @@ impl Walker {
                 {
                     let speed_ratio = (vel_h.len() / cfg.max_speed.max(1e-4)).clamp(0.0, 1.0);
                     let stumble = FAST_STEP_STUMBLE_LOSS * speed_ratio * speed_ratio;
-                    let keep = (1.0 - cfg.step_speed_loss_per_meter * gain - stumble).clamp(0.4, 1.0);
+                    let keep =
+                        (1.0 - cfg.step_speed_loss_per_meter * gain - stumble).clamp(0.4, 1.0);
                     self.pos = pos;
                     self.vel = Vec3::new(vel_h.x * keep, 0.0, vel_h.z * keep);
                     self.contacts.clear();
@@ -382,12 +421,48 @@ mod tests {
     fn push_block(out: &mut Vec<Tri>, min: Vec3, max: Vec3) {
         let (x0, y0, z0) = (min.x, min.y, min.z);
         let (x1, y1, z1) = (max.x, max.y, max.z);
-        quad(out, Vec3::new(x0, y0, z1), Vec3::new(x1, y0, z1), Vec3::new(x1, y1, z1), Vec3::new(x0, y1, z1));
-        quad(out, Vec3::new(x1, y0, z0), Vec3::new(x0, y0, z0), Vec3::new(x0, y1, z0), Vec3::new(x1, y1, z0));
-        quad(out, Vec3::new(x1, y0, z1), Vec3::new(x1, y0, z0), Vec3::new(x1, y1, z0), Vec3::new(x1, y1, z1));
-        quad(out, Vec3::new(x0, y0, z0), Vec3::new(x0, y0, z1), Vec3::new(x0, y1, z1), Vec3::new(x0, y1, z0));
-        quad(out, Vec3::new(x0, y1, z0), Vec3::new(x0, y1, z1), Vec3::new(x1, y1, z1), Vec3::new(x1, y1, z0));
-        quad(out, Vec3::new(x0, y0, z0), Vec3::new(x1, y0, z0), Vec3::new(x1, y0, z1), Vec3::new(x0, y0, z1));
+        quad(
+            out,
+            Vec3::new(x0, y0, z1),
+            Vec3::new(x1, y0, z1),
+            Vec3::new(x1, y1, z1),
+            Vec3::new(x0, y1, z1),
+        );
+        quad(
+            out,
+            Vec3::new(x1, y0, z0),
+            Vec3::new(x0, y0, z0),
+            Vec3::new(x0, y1, z0),
+            Vec3::new(x1, y1, z0),
+        );
+        quad(
+            out,
+            Vec3::new(x1, y0, z1),
+            Vec3::new(x1, y0, z0),
+            Vec3::new(x1, y1, z0),
+            Vec3::new(x1, y1, z1),
+        );
+        quad(
+            out,
+            Vec3::new(x0, y0, z0),
+            Vec3::new(x0, y0, z1),
+            Vec3::new(x0, y1, z1),
+            Vec3::new(x0, y1, z0),
+        );
+        quad(
+            out,
+            Vec3::new(x0, y1, z0),
+            Vec3::new(x0, y1, z1),
+            Vec3::new(x1, y1, z1),
+            Vec3::new(x1, y1, z0),
+        );
+        quad(
+            out,
+            Vec3::new(x0, y0, z0),
+            Vec3::new(x1, y0, z0),
+            Vec3::new(x1, y0, z1),
+            Vec3::new(x0, y0, z1),
+        );
     }
 
     fn flat_floor() -> Vec<Tri> {
@@ -413,7 +488,10 @@ mod tests {
             w.tick(&tris, DT, wish, false);
             if tick >= 5 {
                 assert_eq!(w.contacts.len(), 1, "one floor contact at tick {tick}");
-                assert!(!w.contacts[0].fresh, "floor contact must stay sustained at tick {tick}");
+                assert!(
+                    !w.contacts[0].fresh,
+                    "floor contact must stay sustained at tick {tick}"
+                );
                 assert!(w.grounded, "grounded at tick {tick}");
                 assert!((w.pos.y - cfg.radius).abs() < 1e-3, "height at tick {tick}");
             }
@@ -450,7 +528,11 @@ mod tests {
                 assert!(w.grounded, "grounded at tick {tick}");
             }
         }
-        assert!((w.pos.x - x_ref).abs() < 1e-4, "lateral drift: {}", w.pos.x - x_ref);
+        assert!(
+            (w.pos.x - x_ref).abs() < 1e-4,
+            "lateral drift: {}",
+            w.pos.x - x_ref
+        );
         assert!((w.pos.z - (-10.0 + cfg.radius)).abs() < 1e-3);
     }
 
@@ -471,7 +553,11 @@ mod tests {
                 assert!((w.contacts[0].impact_speed - expected).abs() < 1e-3);
                 let free_fall = (2.0 * cfg.gravity * 0.65).sqrt();
                 assert!((w.contacts[0].impact_speed - free_fall).abs() < 0.15);
-                assert!(w.vel.y.abs() < 1e-3, "vertical speed after landing: {}", w.vel.y);
+                assert!(
+                    w.vel.y.abs() < 1e-3,
+                    "vertical speed after landing: {}",
+                    w.vel.y
+                );
                 landed = true;
                 break;
             }
@@ -515,14 +601,22 @@ mod tests {
         for _ in 0..20 {
             w.tick(&tris, DT, Vec3::ZERO, false);
         }
-        assert!((w.vel.x - 4.0).abs() < 1e-4, "air braking: vx = {}", w.vel.x);
+        assert!(
+            (w.vel.x - 4.0).abs() < 1e-4,
+            "air braking: vx = {}",
+            w.vel.x
+        );
     }
 
     #[test]
     fn climbs_a_small_step_without_getting_stuck() {
         let cfg = WalkConfig::default();
         let mut tris = flat_floor();
-        push_block(&mut tris, Vec3::new(2.0, 0.0, -2.0), Vec3::new(6.0, 0.20, 2.0));
+        push_block(
+            &mut tris,
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(6.0, 0.20, 2.0),
+        );
         let mut w = Walker::new(cfg, Vec3::new(0.0, cfg.radius, 0.0));
         let wish = Vec3::new(1.0, 0.0, 0.0);
 
@@ -532,7 +626,11 @@ mod tests {
             w.tick(&tris, DT, wish, false);
             if w.last_step_y > 0.0 {
                 lifts += 1;
-                assert!((w.last_step_y - 0.20).abs() < 0.02, "gain {}", w.last_step_y);
+                assert!(
+                    (w.last_step_y - 0.20).abs() < 0.02,
+                    "gain {}",
+                    w.last_step_y
+                );
                 assert!(w.vel.x < vx_before, "no speed cost");
                 assert!(w.vel.x > 0.8 * vx_before, "too much speed cost");
             }
@@ -542,14 +640,22 @@ mod tests {
         }
         assert_eq!(lifts, 1, "exactly one step-up expected");
         assert!(w.grounded);
-        assert!((w.pos.y - (cfg.radius + 0.20)).abs() < 0.01, "height {}", w.pos.y);
+        assert!(
+            (w.pos.y - (cfg.radius + 0.20)).abs() < 0.01,
+            "height {}",
+            w.pos.y
+        );
     }
 
     #[test]
     fn does_not_climb_a_wall_higher_than_max_step() {
         let cfg = WalkConfig::default();
         let mut tris = flat_floor();
-        push_block(&mut tris, Vec3::new(2.0, 0.0, -2.0), Vec3::new(6.0, 0.60, 2.0));
+        push_block(
+            &mut tris,
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(6.0, 0.60, 2.0),
+        );
         let mut w = Walker::new(cfg, Vec3::new(0.0, cfg.radius, 0.0));
         let wish = Vec3::new(1.0, 0.0, 0.0);
 
@@ -558,7 +664,11 @@ mod tests {
             assert_eq!(w.last_step_y, 0.0, "unexpected step at tick {tick}");
         }
         assert!(w.pos.x < 2.0 - cfg.radius + 0.01, "x = {}", w.pos.x);
-        assert!(w.pos.x > 2.0 - cfg.radius - 0.1, "bounced away: x = {}", w.pos.x);
+        assert!(
+            w.pos.x > 2.0 - cfg.radius - 0.1,
+            "bounced away: x = {}",
+            w.pos.x
+        );
         assert!(w.pos.y < cfg.radius + 0.01, "climbed: y = {}", w.pos.y);
     }
 
@@ -566,7 +676,11 @@ mod tests {
     fn walking_off_a_small_step_keeps_grounded_and_reports_the_drop() {
         let cfg = WalkConfig::default();
         let mut tris = flat_floor();
-        push_block(&mut tris, Vec3::new(-6.0, 0.0, -2.0), Vec3::new(2.0, 0.20, 2.0));
+        push_block(
+            &mut tris,
+            Vec3::new(-6.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.20, 2.0),
+        );
         let mut w = Walker::new(cfg, Vec3::new(-1.0, cfg.radius + 0.20, 0.0));
         let wish = Vec3::new(1.0, 0.0, 0.0);
 
@@ -593,8 +707,16 @@ mod tests {
     fn low_ceiling_over_the_step_blocks_the_climb() {
         let cfg = WalkConfig::default();
         let mut tris = flat_floor();
-        push_block(&mut tris, Vec3::new(2.0, 0.0, -2.0), Vec3::new(6.0, 0.20, 2.0));
-        push_block(&mut tris, Vec3::new(2.0, 0.80, -2.0), Vec3::new(6.0, 1.20, 2.0));
+        push_block(
+            &mut tris,
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(6.0, 0.20, 2.0),
+        );
+        push_block(
+            &mut tris,
+            Vec3::new(2.0, 0.80, -2.0),
+            Vec3::new(6.0, 1.20, 2.0),
+        );
         let mut w = Walker::new(cfg, Vec3::new(0.0, cfg.radius, 0.0));
         let wish = Vec3::new(1.0, 0.0, 0.0);
 
@@ -610,7 +732,11 @@ mod tests {
     fn standing_near_step_edge_does_not_slip() {
         let cfg = WalkConfig::default();
         let mut tris = flat_floor();
-        push_block(&mut tris, Vec3::new(-4.0, 0.0, -2.0), Vec3::new(2.0, 0.50, 2.0));
+        push_block(
+            &mut tris,
+            Vec3::new(-4.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.50, 2.0),
+        );
         // Sphere center slightly past the edge (x = 2.15), resting on the corner with tilted normal.
         let dy = (cfg.radius * cfg.radius - 0.15_f32 * 0.15_f32).sqrt();
         let start = Vec3::new(2.15, 0.50 + dy, 0.0);
@@ -632,14 +758,26 @@ mod tests {
         let cfg = WalkConfig::default();
         let mut tris = flat_floor();
         // Step with a low ceiling so step-up is blocked and the riser takes the full impact.
-        push_block(&mut tris, Vec3::new(2.0, 0.0, -2.0), Vec3::new(6.0, 0.20, 2.0));
-        push_block(&mut tris, Vec3::new(2.0, 0.80, -2.0), Vec3::new(6.0, 1.20, 2.0));
+        push_block(
+            &mut tris,
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(6.0, 0.20, 2.0),
+        );
+        push_block(
+            &mut tris,
+            Vec3::new(2.0, 0.80, -2.0),
+            Vec3::new(6.0, 1.20, 2.0),
+        );
         let mut w = Walker::new(cfg, Vec3::new(1.5, cfg.radius, 0.0));
         w.vel = Vec3::new(8.0, 0.0, 0.0);
 
         for tick in 0..30 {
             w.tick(&tris, DT, Vec3::new(1.0, 0.0, 0.0), false);
-            assert!(w.vel.x > -0.1, "bounced off step at tick {tick}: vx = {}", w.vel.x);
+            assert!(
+                w.vel.x > -0.1,
+                "bounced off step at tick {tick}: vx = {}",
+                w.vel.x
+            );
         }
     }
 
@@ -647,7 +785,11 @@ mod tests {
     fn tall_wall_still_bounces_at_high_speed() {
         let cfg = WalkConfig::default();
         let mut tris = flat_floor();
-        push_block(&mut tris, Vec3::new(2.0, 0.0, -2.0), Vec3::new(6.0, 2.0, 2.0));
+        push_block(
+            &mut tris,
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(6.0, 2.0, 2.0),
+        );
         let mut w = Walker::new(cfg, Vec3::new(1.5, cfg.radius, 0.0));
         w.vel = Vec3::new(8.0, 0.0, 0.0);
 
@@ -669,7 +811,8 @@ mod tests {
         w.sprinting = true;
         let wish = Vec3::new(1.0, 0.0, 0.0);
 
-        for _ in 0..80 {
+        let ticks = (cfg.sprint_speed / (cfg.accel * DT)).ceil() as usize + 2;
+        for _ in 0..ticks {
             w.tick(&tris, DT, wish, false);
         }
         assert!(

@@ -127,7 +127,7 @@ fn run_speed_bench() {
     let cos_det = CosineSliver::from_degrees(limit_deg);
     let chord_det = ChordSliver::from_degrees(limit_deg);
 
-    let mut rng = Rng::new(0xC0FFEE_1234_5678);
+    let mut rng = Rng::new(0x00C0_FFEE_1234_5678);
     let mut aos = Vec::with_capacity(SPEED_N);
     let mut sa = Vec::with_capacity(SPEED_N);
     let mut sb = Vec::with_capacity(SPEED_N);

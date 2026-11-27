@@ -69,7 +69,13 @@ pub struct SphereContact {
 }
 
 /// Sphere vs triangle overlap test. Two-sided: the normal always points toward the sphere center.
-pub fn sphere_triangle(center: Vec3, radius: f32, a: Vec3, b: Vec3, c: Vec3) -> Option<SphereContact> {
+pub fn sphere_triangle(
+    center: Vec3,
+    radius: f32,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+) -> Option<SphereContact> {
     let q = closest_point_on_triangle(center, a, b, c);
     let d = center - q;
     let dist_sq = d.len_sq();

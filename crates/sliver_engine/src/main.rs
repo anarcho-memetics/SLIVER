@@ -151,8 +151,8 @@ fn main() {
         }
 
         // Camera rotation: mouse drag (LMB or RMB) + keyboard fallback
-        let mouse_look = window.get_mouse_down(MouseButton::Left)
-            || window.get_mouse_down(MouseButton::Right);
+        let mouse_look =
+            window.get_mouse_down(MouseButton::Left) || window.get_mouse_down(MouseButton::Right);
         if mouse_look {
             if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Pass) {
                 if let Some((lx, ly)) = last_mouse {
@@ -215,7 +215,13 @@ fn main() {
             jump_queued = false;
 
             let speed = Vec3::new(walker.vel.x, 0.0, walker.vel.z).len();
-            bob.tick(STEP, speed, walker.cfg.max_speed, walker.grounded, walker.last_step_y);
+            bob.tick(
+                STEP,
+                speed,
+                walker.cfg.max_speed,
+                walker.grounded,
+                walker.last_step_y,
+            );
         }
 
         // The camera follows the body: eye offset + step smoothing + view bob.
