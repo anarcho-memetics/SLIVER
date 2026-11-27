@@ -7,6 +7,7 @@ mod raster;
 mod raycast;
 mod scene;
 mod view_bob;
+mod wad;
 
 use controller::{WalkConfig, Walker};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, Window, WindowOptions};
@@ -28,19 +29,55 @@ const MOUSE_SENS: f32 = 0.0035;
 
 fn main() {
     let arg_path = env::args().nth(1);
-    let (mut world_tris, is_custom_obj) = match arg_path {
-        Some(ref p) => match load_obj(Path::new(p)) {
-            Ok(tris) => {
-                println!("Loaded {p}: {} triangles", tris.len());
-                (tris, true)
+    let arg_map = env::args().nth(2);
+    let mut walk_cfg = WalkConfig::default();
+    let (mut world_tris, world_textures, is_external_map, body_start, start_yaw, default_fog_end) =
+        match arg_path {
+            Some(ref p) if p.to_ascii_lowercase().ends_with(".wad") => {
+                match wad::load_wad_map(Path::new(p), arg_map.as_deref()) {
+                    Ok(map) => {
+                        // Doom's MAXSTEPHEIGHT is 24 map units (~0.67 m at 1/36 scale).
+                        walk_cfg.max_step_height = 0.70;
+                        println!(
+                            "Loaded {p} ({}): {} triangles, {} textures",
+                            map.name,
+                            map.tris.len(),
+                            map.textures.len()
+                        );
+                        (
+                            map.tris,
+                            map.textures,
+                            true,
+                            map.spawn_pos + Vec3::new(0.0, walk_cfg.radius, 0.0),
+                            map.spawn_yaw,
+                            55.0,
+                        )
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return;
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("{e}");
-                return;
-            }
-        },
-        None => (build_demo_room(), false),
-    };
+            Some(ref p) => match load_obj(Path::new(p)) {
+                Ok(tris) => {
+                    println!("Loaded {p}: {} triangles", tris.len());
+                    (tris, Vec::new(), true, Vec3::new(0.0, 1.5, 8.0), 0.0, 20.0)
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return;
+                }
+            },
+            None => (
+                build_demo_room(),
+                Vec::new(),
+                false,
+                Vec3::new(0.0, walk_cfg.radius, 4.2),
+                0.0,
+                20.0,
+            ),
+        };
 
     let mut thresh_idx = 2usize; // default threshold: 12 deg
     let mut sliver_count = tag_slivers(&mut world_tris, THRESHOLDS[thresh_idx]);
@@ -59,16 +96,7 @@ fn main() {
 
     let mut fb = Framebuffer::new(W, H);
 
-    // Body (sphere center) and camera are separate: the eye sits EYE_HEIGHT above the floor,
-    // i.e. (EYE_HEIGHT - radius) above the sphere center.
-    let walk_cfg = WalkConfig::default();
     let eye_offset = Vec3::new(0.0, EYE_HEIGHT - walk_cfg.radius, 0.0);
-    // A custom .obj has no guaranteed floor under this spot: the body falls until it finds one.
-    let body_start = if is_custom_obj {
-        Vec3::new(0.0, 1.5, 8.0)
-    } else {
-        Vec3::new(0.0, walk_cfg.radius, 4.2)
-    };
     let mut walker = Walker::new(walk_cfg, body_start);
     let mut bob = ViewBob::new();
     let mut prev_body_pos = walker.pos;
@@ -76,7 +104,7 @@ fn main() {
 
     let mut cam = Camera {
         pos: walker.pos + eye_offset,
-        yaw: 0.0,
+        yaw: start_yaw,
         pitch: -0.05,
         fov_y_rad: 68.0_f32.to_radians(),
         near: 0.12,
@@ -84,10 +112,11 @@ fn main() {
 
     let mut cfg = RenderConfig {
         debug_slivers: false,
+        textures_enabled: true,
         fog_enabled: true,
         fog_color: [16, 20, 26],
         fog_start: 4.5,
-        fog_end: 20.0,
+        fog_end: default_fog_end,
         light_dir: Vec3::new(0.45, 0.82, 0.35).normalize(),
     };
 
@@ -132,7 +161,7 @@ fn main() {
                 None => println!("No hit"),
             }
         }
-        if window.is_key_pressed(Key::F5, KeyRepeat::No) && !is_custom_obj {
+        if window.is_key_pressed(Key::F5, KeyRepeat::No) && !is_external_map {
             in_playground = !in_playground;
             world_tris = if in_playground {
                 build_playground()
@@ -155,6 +184,9 @@ fn main() {
         if window.is_key_pressed(Key::F6, KeyRepeat::No) {
             slow_mo = !slow_mo;
             println!("Slow motion: {}", if slow_mo { "ON" } else { "OFF" });
+        }
+        if window.is_key_pressed(Key::F7, KeyRepeat::No) {
+            cfg.textures_enabled = !cfg.textures_enabled;
         }
         // Jump is a press edge, consumed by the first physics tick that runs.
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
@@ -263,10 +295,10 @@ fn main() {
 
         let t_render = Instant::now();
         fb.clear(cfg.fog_color);
-        let mut drawn = fb.draw_triangles(&world_tris, &render_cam, &cfg);
-        if !is_custom_obj {
+        let mut drawn = fb.draw_triangles(&world_tris, &world_textures, &render_cam, &cfg);
+        if !is_external_map {
             let spinner = build_spinner(elapsed * 1.1, Vec3::new(0.0, 2.5, -4.0));
-            drawn += fb.draw_triangles(&spinner, &render_cam, &cfg);
+            drawn += fb.draw_triangles(&spinner, &[], &render_cam, &cfg);
         }
         render_ms_acc += t_render.elapsed().as_secs_f32() * 1000.0;
 
@@ -279,8 +311,10 @@ fn main() {
             let avg_render_ms = render_ms_acc / fps_frames as f32;
             let mode = if cfg.debug_slivers {
                 "SLIVER-DEBUG"
+            } else if cfg.textures_enabled {
+                "TEX"
             } else {
-                "NORMAL"
+                "FLAT"
             };
             window.set_title(&format!(
                 "sliver_engine | {:.0} FPS ({:.2} ms) | tris: {}/{} | slivers (<{}°): {} | [F1] {}",

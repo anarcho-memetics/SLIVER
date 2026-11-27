@@ -2,12 +2,50 @@ use sliver_math::{ChordSliver, Vec3};
 use std::fs;
 use std::path::Path;
 
+pub const NO_TEX: u16 = u16::MAX;
+
+#[derive(Clone, Debug)]
+pub struct Texture {
+    pub width: usize,
+    pub height: usize,
+    /// Packed `0x00RRGGBB` texels in row-major order.
+    pub pixels: Vec<u32>,
+    /// `(width - 1, height - 1, width.trailing_zeros())` when both dimensions are powers of two.
+    pub pow2: Option<(usize, usize, u32)>,
+}
+
+impl Texture {
+    pub fn new(width: usize, height: usize, pixels: Vec<u32>) -> Self {
+        debug_assert_eq!(pixels.len(), width * height);
+        let pow2 = if width > 0 && height > 0 && width.is_power_of_two() && height.is_power_of_two()
+        {
+            Some((width - 1, height - 1, width.trailing_zeros()))
+        } else {
+            None
+        };
+        Self {
+            width,
+            height,
+            pixels,
+            pow2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Tri {
     pub p0: Vec3,
     pub p1: Vec3,
     pub p2: Vec3,
+    /// Texture coordinates in texel space (`(u, v)` per vertex).
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
     pub color: [u8; 3],
+    /// Per-triangle light level (`0..=255`, used to modulate textured surfaces).
+    pub light: u8,
+    /// Index into the scene texture table, or `NO_TEX` for solid-colored triangles.
+    pub tex_id: u16,
     pub is_sliver: bool,
 }
 
@@ -17,7 +55,38 @@ impl Tri {
             p0,
             p1,
             p2,
+            uv0: [0.0, 0.0],
+            uv1: [0.0, 0.0],
+            uv2: [0.0, 0.0],
             color,
+            light: 255,
+            tex_id: NO_TEX,
+            is_sliver: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_textured(
+        p0: Vec3,
+        p1: Vec3,
+        p2: Vec3,
+        uv0: [f32; 2],
+        uv1: [f32; 2],
+        uv2: [f32; 2],
+        color: [u8; 3],
+        tex_id: u16,
+        light: u8,
+    ) -> Self {
+        Self {
+            p0,
+            p1,
+            p2,
+            uv0,
+            uv1,
+            uv2,
+            color,
+            light,
+            tex_id,
             is_sliver: false,
         }
     }
