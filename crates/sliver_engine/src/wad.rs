@@ -64,8 +64,6 @@ struct Sidedef {
 
 #[derive(Clone, Copy)]
 struct Seg {
-    v1: u16,
-    v2: u16,
     linedef: u16,
     direction: i16,
 }
@@ -495,7 +493,7 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
     let sectors_b = find_map_lump(&lumps, map_idx, "SECTORS")?;
 
     let things: Vec<Thing> = things_b
-        .chunks_exact(10)
+        .as_chunks::<10>().0.iter()
         .map(|c| Thing {
             x: read_i16(c, 0),
             y: read_i16(c, 2),
@@ -505,12 +503,12 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let verts: Vec<(f32, f32)> = vertexes_b
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| (read_i16(c, 0) as f32, read_i16(c, 2) as f32))
         .collect();
 
     let linedefs: Vec<Linedef> = linedefs_b
-        .chunks_exact(14)
+        .as_chunks::<14>().0.iter()
         .map(|c| Linedef {
             v1: read_u16(c, 0),
             v2: read_u16(c, 2),
@@ -522,7 +520,7 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let sidedefs: Vec<Sidedef> = sidedefs_b
-        .chunks_exact(30)
+        .as_chunks::<30>().0.iter()
         .map(|c| Sidedef {
             x_off: read_i16(c, 0),
             y_off: read_i16(c, 2),
@@ -534,17 +532,15 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let segs: Vec<Seg> = segs_b
-        .chunks_exact(12)
+        .as_chunks::<12>().0.iter()
         .map(|c| Seg {
-            v1: read_u16(c, 0),
-            v2: read_u16(c, 2),
             linedef: read_u16(c, 6),
             direction: read_i16(c, 8),
         })
         .collect();
 
     let ssectors: Vec<Subsector> = ssectors_b
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| Subsector {
             num_segs: read_u16(c, 0),
             first_seg: read_u16(c, 2),
@@ -552,7 +548,7 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let nodes: Vec<Node> = nodes_b
-        .chunks_exact(28)
+        .as_chunks::<28>().0.iter()
         .map(|c| Node {
             x: read_i16(c, 0),
             y: read_i16(c, 2),
@@ -564,7 +560,7 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let mut sectors: Vec<Sector> = sectors_b
-        .chunks_exact(26)
+        .as_chunks::<26>().0.iter()
         .map(|c| Sector {
             floor_h: read_i16(c, 0),
             ceil_h: read_i16(c, 2),
@@ -953,18 +949,24 @@ fn emit_subsector_flats(ctx: &mut BspBuildCtx<'_, '_>, ss_idx: usize, mut poly: 
     let end = start.saturating_add(ss.num_segs as usize).min(ctx.segs.len());
     let ss_segs = &ctx.segs[start..end];
 
-    // Clip the node polygon by each explicit seg of this subsector (right half-plane = interior).
-    // Skip any linedef appearing with both directions inside the same subsector.
+    // Clip the node polygon only by one-sided walls (void boundaries), using the parent
+    // linedef's unrounded vertices instead of DoomBSP's i16-rounded split seg vertices.
+    // Internal boundaries between subsectors are already partitioned watertightly by `NODES`.
     for seg in ss_segs {
-        let has_opposite = ss_segs
-            .iter()
-            .any(|other| other.linedef == seg.linedef && other.direction != seg.direction);
-        if has_opposite {
+        let Some(ld) = ctx.linedefs.get(seg.linedef as usize) else {
+            continue;
+        };
+        if ld.back != NO_SIDEDEF && (ld.back as usize) < ctx.sidedefs.len() {
             continue;
         }
+        let (v_start, v_end) = if seg.direction == 0 {
+            (ld.v1, ld.v2)
+        } else {
+            (ld.v2, ld.v1)
+        };
         let (Some(&a), Some(&b)) = (
-            ctx.verts.get(seg.v1 as usize),
-            ctx.verts.get(seg.v2 as usize),
+            ctx.verts.get(v_start as usize),
+            ctx.verts.get(v_end as usize),
         ) else {
             continue;
         };
@@ -1419,5 +1421,102 @@ mod tests {
     fn rejects_invalid_header() {
         let err = load_wad_map_bytes(b"NOPE00000000", None).unwrap_err();
         assert!(err.contains("Invalid WAD header"));
+    }
+    #[test]
+    fn rounded_two_sided_seg_does_not_open_floor_wedge() {
+        let mut things = Vec::new();
+        for v in [0i16, 0, 90, 1, 7] {
+            things.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // 256x256 room plus vertex 4 rounded off the diagonal (-128,-128)->(128,128).
+        let mut verts = Vec::new();
+        for (x, y) in [(-128i16, -128i16), (-128, 128), (128, 128), (128, -128), (0, -2)] {
+            verts.extend_from_slice(&x.to_le_bytes());
+            verts.extend_from_slice(&y.to_le_bytes());
+        }
+
+        let mut linedefs = Vec::new();
+        for i in 0..4u16 {
+            let next = (i + 1) % 4;
+            for v in [i, next, 1u16, 0, 0, 0, NO_SIDEDEF] {
+                linedefs.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        // Linedef 4: internal two-sided diagonal 0 -> 2.
+        for v in [0u16, 2, 4, 0, 0, 0, 0] {
+            linedefs.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let mut sidedefs = Vec::new();
+        sidedefs.extend_from_slice(&0i16.to_le_bytes());
+        sidedefs.extend_from_slice(&0i16.to_le_bytes());
+        push_name(&mut sidedefs, "-");
+        push_name(&mut sidedefs, "-");
+        push_name(&mut sidedefs, "STARTAN3");
+        sidedefs.extend_from_slice(&0u16.to_le_bytes());
+
+        // Subsector 0 (right of diagonal): walls 2, 3 + rounded two-sided seg 0->4.
+        // Subsector 1 (left of diagonal): walls 0, 1 + rounded two-sided seg 2->4.
+        let mut segs = Vec::new();
+        for &(v1, v2, ld, dir) in &[
+            (2u16, 3u16, 2u16, 0u16),
+            (3, 0, 3, 0),
+            (0, 4, 4, 0),
+            (0, 1, 0, 0),
+            (1, 2, 1, 0),
+            (2, 4, 4, 1),
+        ] {
+            for v in [v1, v2, 0, ld, dir, 0] {
+                segs.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        let mut ssectors = Vec::new();
+        for &(count, first) in &[(3u16, 0u16), (3, 3)] {
+            ssectors.extend_from_slice(&count.to_le_bytes());
+            ssectors.extend_from_slice(&first.to_le_bytes());
+        }
+
+        let mut nodes = Vec::new();
+        for v in [-128i16, -128, 256, 256] {
+            nodes.extend_from_slice(&v.to_le_bytes());
+        }
+        nodes.extend_from_slice(&[0u8; 16]); // bboxes unused
+        nodes.extend_from_slice(&(SUBSECTOR_BIT).to_le_bytes());
+        nodes.extend_from_slice(&(SUBSECTOR_BIT | 1).to_le_bytes());
+
+        let mut sectors = Vec::new();
+        sectors.extend_from_slice(&0i16.to_le_bytes());
+        sectors.extend_from_slice(&128i16.to_le_bytes());
+        push_name(&mut sectors, "FLOOR4_8");
+        push_name(&mut sectors, "F_SKY1");
+        sectors.extend_from_slice(&192i16.to_le_bytes());
+        sectors.extend_from_slice(&0i16.to_le_bytes());
+        sectors.extend_from_slice(&0i16.to_le_bytes());
+
+        let wad = build_wad(&[
+            ("E1M1", Vec::new()),
+            ("THINGS", things),
+            ("LINEDEFS", linedefs),
+            ("SIDEDEFS", sidedefs),
+            ("VERTEXES", verts),
+            ("SEGS", segs),
+            ("SSECTORS", ssectors),
+            ("NODES", nodes),
+            ("SECTORS", sectors),
+        ]);
+        let map = load_wad_map_bytes(&wad, None).expect("split WAD should parse");
+        let floor_area: f32 = map
+            .tris
+            .iter()
+            .filter(|t| t.normal().y > 0.99)
+            .map(|t| 0.5 * (t.p1 - t.p0).cross(t.p2 - t.p0).len())
+            .sum();
+        let expected = (256.0 * DOOM_SCALE) * (256.0 * DOOM_SCALE);
+        assert!(
+            (floor_area - expected).abs() < 1e-3,
+            "floor area {floor_area} != expected {expected}"
+        );
     }
 }

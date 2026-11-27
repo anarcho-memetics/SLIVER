@@ -1,5 +1,14 @@
 use crate::scene::{Texture, Tri, NO_TEX};
 use sliver_math::Vec3;
+use std::thread;
+
+/// Perspective-correct texture span length in pixels (Quake-style 16 px subdivision).
+const SPAN_SIZE: usize = 16;
+const INV_SPAN_SIZE: f32 = 1.0 / SPAN_SIZE as f32;
+/// Minimum projected triangle count before spawning worker bands.
+const MT_TRI_THRESHOLD: usize = 16;
+/// Cap worker threads to keep band sizes L2-friendly and avoid Windows spawn overhead.
+const MAX_THREADS: usize = 8;
 
 pub struct Camera {
     pub pos: Vec3,
@@ -53,20 +62,83 @@ struct ClipVert {
     uv: [f32; 2],
 }
 
+#[derive(Clone, Copy)]
+struct ProjCtx {
+    width: usize,
+    height: usize,
+    wf: f32,
+    hf: f32,
+    cx: f32,
+    cy: f32,
+    focal: f32,
+    fog_enabled: bool,
+    fog_start: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedTri {
+    min_x: usize,
+    max_x: usize,
+    min_y: usize,
+    max_y: usize,
+    e0_base: f32,
+    e1_base: f32,
+    e2_base: f32,
+    dx0: f32,
+    dy0: f32,
+    inv_dx0: f32,
+    dx1: f32,
+    dy1: f32,
+    inv_dx1: f32,
+    dx2: f32,
+    dy2: f32,
+    inv_dx2: f32,
+    iz_base: f32,
+    diz_dx: f32,
+    diz_dy: f32,
+    uz_base: f32,
+    duz_dx: f32,
+    duz_dy: f32,
+    vz_base: f32,
+    dvz_dx: f32,
+    dvz_dy: f32,
+    /// Descending sort key (`iz0 + iz1 + iz2`) for front-to-back overdraw rejection.
+    sort_iz: f32,
+    solid_packed: u32,
+    shade256: u32,
+    tex_id: u16,
+    need_fog: bool,
+}
+
+struct Band<'a> {
+    color: &'a mut [u32],
+    inv_z: &'a mut [f32],
+    width: usize,
+    y0: usize,
+}
+
 pub struct Framebuffer {
     pub width: usize,
     pub height: usize,
     pub color: Vec<u32>,
     pub inv_z: Vec<f32>,
+    projected: Vec<ProjectedTri>,
+    num_threads: usize,
 }
 
 impl Framebuffer {
     pub fn new(width: usize, height: usize) -> Self {
+        let num_threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, MAX_THREADS);
         Self {
             width,
             height,
             color: vec![0; width * height],
             inv_z: vec![0.0; width * height],
+            projected: Vec::with_capacity(1024),
+            num_threads,
         }
     }
 
@@ -83,8 +155,14 @@ impl Framebuffer {
         cam: &Camera,
         cfg: &RenderConfig,
     ) -> usize {
+        if self.width == 0 || self.height == 0 {
+            return 0;
+        }
+
         let (right, up, forward) = cam.basis();
-        let focal = (self.height as f32 * 0.5) / (cam.fov_y_rad * 0.5).tan();
+        let wf = self.width as f32;
+        let hf = self.height as f32;
+        let focal = (hf * 0.5) / (cam.fov_y_rad * 0.5).tan();
         let iz_near = 1.0 / cfg.fog_start.max(1e-4);
         let iz_far = 1.0 / cfg.fog_end.max(cfg.fog_start + 1e-4);
         let fog = FogParams {
@@ -95,21 +173,26 @@ impl Framebuffer {
             inv_iz_span: 256.0 / (iz_near - iz_far),
             enabled: cfg.fog_enabled,
         };
-        let mut drawn = 0;
+        let pctx = ProjCtx {
+            width: self.width,
+            height: self.height,
+            wf,
+            hf,
+            cx: wf * 0.5,
+            cy: hf * 0.5,
+            focal,
+            fog_enabled: fog.enabled,
+            fog_start: fog.start,
+        };
 
+        // Phase 1: cull, clip against near plane, shade, and project into a reusable buffer.
+        self.projected.clear();
         for tri in tris {
             let n = tri.normal();
             // World-space backface culling
             if n.dot(cam.pos - tri.p0) <= 0.0 {
                 continue;
             }
-
-            let ndotl = n.dot(cfg.light_dir).max(0.0);
-            let tex = if cfg.textures_enabled && !cfg.debug_slivers && tri.tex_id != NO_TEX {
-                textures.get(tri.tex_id as usize)
-            } else {
-                None
-            };
 
             let v0 = ClipVert {
                 pos: cam.world_to_view(tri.p0, right, up, forward),
@@ -129,22 +212,27 @@ impl Framebuffer {
                 continue;
             }
 
-            if let Some(tex) = tex {
+            let ndotl = n.dot(cfg.light_dir).max(0.0);
+            let tex_id = if cfg.textures_enabled
+                && !cfg.debug_slivers
+                && tri.tex_id != NO_TEX
+                && (tri.tex_id as usize) < textures.len()
+            {
+                tri.tex_id
+            } else {
+                NO_TEX
+            };
+
+            let (shade256, solid_packed) = if tex_id != NO_TEX {
                 let light_norm = (tri.light as f32) / 255.0;
                 let sector_scale = 0.22 + 0.78 * light_norm;
                 let dir_shade = (0.74 + 0.08 * (n.y * 0.5 + 0.5) + 0.18 * ndotl).min(1.0);
-                let shade256 = ((sector_scale * dir_shade * 256.0).round() as u32).clamp(0, 256);
-
-                for c in &clipped[..count] {
-                    if self.rasterize_view_tri_textured(c.0, c.1, c.2, focal, tex, shade256, fog) {
-                        drawn += 1;
-                    }
-                }
+                let s256 = ((sector_scale * dir_shade * 256.0).round() as u32).clamp(0, 256);
+                (s256, 0)
             } else {
                 // Hemispherical ambient + directional diffuse shading
                 let hemi = 0.40 + 0.12 * (n.y * 0.5 + 0.5);
                 let shade = (hemi + 0.48 * ndotl).min(1.0);
-
                 let lit = if cfg.debug_slivers {
                     if tri.is_sliver {
                         scale_rgb([250, 42, 68], 0.65 + 0.35 * ndotl)
@@ -154,401 +242,445 @@ impl Framebuffer {
                 } else {
                     scale_rgb(tri.color, shade)
                 };
-                let solid_packed = pack_rgb(lit[0], lit[1], lit[2]);
+                (256, pack_rgb(lit[0], lit[1], lit[2]))
+            };
 
-                for c in &clipped[..count] {
-                    if self.rasterize_view_tri_solid(
-                        c.0.pos,
-                        c.1.pos,
-                        c.2.pos,
-                        focal,
-                        solid_packed,
-                        fog,
-                    ) {
-                        drawn += 1;
-                    }
+            for c in &clipped[..count] {
+                if let Some(proj) =
+                    project_tri(c.0, c.1, c.2, &pctx, tex_id, shade256, solid_packed)
+                {
+                    self.projected.push(proj);
                 }
             }
         }
+
+        let drawn = self.projected.len();
+        if drawn == 0 {
+            return 0;
+        }
+
+        // Front-to-back sort (largest 1/z sum first) so nearer walls reject background overdraw.
+        self.projected
+            .sort_unstable_by(|a, b| b.sort_iz.total_cmp(&a.sort_iz));
+
+        // Phase 2: rasterize horizontal bands in parallel across CPU cores.
+        let width = self.width;
+        let height = self.height;
+        let projected = &self.projected;
+        let n_threads = self.num_threads.min(height);
+
+        if n_threads <= 1 || drawn < MT_TRI_THRESHOLD {
+            let mut band = Band {
+                color: &mut self.color,
+                inv_z: &mut self.inv_z,
+                width,
+                y0: 0,
+            };
+            rasterize_band(&mut band, projected, textures, fog);
+        } else {
+            let rows_per_band = height.div_ceil(n_threads);
+            let pixels_per_band = rows_per_band * width;
+            let color_chunks = self.color.chunks_mut(pixels_per_band);
+            let inv_z_chunks = self.inv_z.chunks_mut(pixels_per_band);
+
+            thread::scope(|scope| {
+                for (band_idx, (color_band, inv_z_band)) in
+                    color_chunks.zip(inv_z_chunks).enumerate()
+                {
+                    let band_y0 = band_idx * rows_per_band;
+                    scope.spawn(move || {
+                        let mut band = Band {
+                            color: color_band,
+                            inv_z: inv_z_band,
+                            width,
+                            y0: band_y0,
+                        };
+                        rasterize_band(&mut band, projected, textures, fog);
+                    });
+                }
+            });
+        }
+
         drawn
     }
+}
 
-    fn rasterize_view_tri_solid(
-        &mut self,
-        v0: Vec3,
-        v1: Vec3,
-        v2: Vec3,
-        focal: f32,
-        solid_packed: u32,
-        fog: FogParams,
-    ) -> bool {
-        let wf = self.width as f32;
-        let hf = self.height as f32;
-        let cx = wf * 0.5;
-        let cy = hf * 0.5;
+fn project_tri(
+    v0: ClipVert,
+    v1: ClipVert,
+    v2: ClipVert,
+    ctx: &ProjCtx,
+    tex_id: u16,
+    shade256: u32,
+    solid_packed: u32,
+) -> Option<ProjectedTri> {
+    let iz0 = 1.0 / v0.pos.z;
+    let iz1 = 1.0 / v1.pos.z;
+    let iz2 = 1.0 / v2.pos.z;
 
-        let iz0 = 1.0 / v0.z;
-        let iz1 = 1.0 / v1.z;
-        let iz2 = 1.0 / v2.z;
+    let sx0 = ctx.cx + v0.pos.x * iz0 * ctx.focal;
+    let sy0 = ctx.cy - v0.pos.y * iz0 * ctx.focal;
+    let sx1 = ctx.cx + v1.pos.x * iz1 * ctx.focal;
+    let sy1 = ctx.cy - v1.pos.y * iz1 * ctx.focal;
+    let sx2 = ctx.cx + v2.pos.x * iz2 * ctx.focal;
+    let sy2 = ctx.cy - v2.pos.y * iz2 * ctx.focal;
 
-        let sx0 = cx + v0.x * iz0 * focal;
-        let sy0 = cy - v0.y * iz0 * focal;
-        let sx1 = cx + v1.x * iz1 * focal;
-        let sy1 = cy - v1.y * iz1 * focal;
-        let sx2 = cx + v2.x * iz2 * focal;
-        let sy2 = cy - v2.y * iz2 * focal;
-
-        let area = edge(sx0, sy0, sx1, sy1, sx2, sy2);
-        if area <= 0.0 {
-            return false;
-        }
-
-        let min_xf = sx0.min(sx1).min(sx2).floor();
-        let max_xf = sx0.max(sx1).max(sx2).ceil();
-        let min_yf = sy0.min(sy1).min(sy2).floor();
-        let max_yf = sy0.max(sy1).max(sy2).ceil();
-
-        if max_xf < 0.0 || min_xf >= wf || max_yf < 0.0 || min_yf >= hf {
-            return false;
-        }
-
-        let min_x = min_xf.max(0.0) as usize;
-        let max_x = (max_xf as usize).min(self.width - 1);
-        let min_y = min_yf.max(0.0) as usize;
-        let max_y = (max_yf as usize).min(self.height - 1);
-        if min_x > max_x || min_y > max_y {
-            return false;
-        }
-
-        let start_px = min_x as f32 + 0.5;
-        let start_py = min_y as f32 + 0.5;
-
-        let mut e0_row = edge(sx1, sy1, sx2, sy2, start_px, start_py);
-        let mut e1_row = edge(sx2, sy2, sx0, sy0, start_px, start_py);
-        let mut e2_row = edge(sx0, sy0, sx1, sy1, start_px, start_py);
-
-        let dx0 = sy2 - sy1;
-        let dy0 = sx1 - sx2;
-        let dx1 = sy0 - sy2;
-        let dy1 = sx2 - sx0;
-        let dx2 = sy1 - sy0;
-        let dy2 = sx0 - sx1;
-
-        let inv_area = 1.0 / area;
-        let mut iz_row = (e0_row * iz0 + e1_row * iz1 + e2_row * iz2) * inv_area;
-        let diz_dx = (dx0 * iz0 + dx1 * iz1 + dx2 * iz2) * inv_area;
-        let diz_dy = (dy0 * iz0 + dy1 * iz1 + dy2 * iz2) * inv_area;
-
-        let need_fog = fog.enabled && v0.z.max(v1.z).max(v2.z) > fog.start;
-
-        if need_fog {
-            for y in min_y..=max_y {
-                let row = y * self.width;
-                let inv_z_slice = &mut self.inv_z[row + min_x..=row + max_x];
-                let color_slice = &mut self.color[row + min_x..=row + max_x];
-
-                let mut e0 = e0_row;
-                let mut e1 = e1_row;
-                let mut e2 = e2_row;
-                let mut iz = iz_row;
-                let mut entered = false;
-
-                for (iz_cell, col_cell) in inv_z_slice.iter_mut().zip(color_slice.iter_mut()) {
-                    if e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0 {
-                        entered = true;
-                        if iz > *iz_cell {
-                            *iz_cell = iz;
-                            *col_cell = if iz >= fog.iz_near {
-                                solid_packed
-                            } else if iz <= fog.iz_far {
-                                fog.packed
-                            } else {
-                                let t256 = ((fog.iz_near - iz) * fog.inv_iz_span) as u32;
-                                lerp_packed(solid_packed, fog.packed, t256.min(256))
-                            };
-                        }
-                    } else if entered {
-                        break;
-                    }
-                    e0 += dx0;
-                    e1 += dx1;
-                    e2 += dx2;
-                    iz += diz_dx;
-                }
-
-                e0_row += dy0;
-                e1_row += dy1;
-                e2_row += dy2;
-                iz_row += diz_dy;
-            }
-        } else {
-            for y in min_y..=max_y {
-                let row = y * self.width;
-                let inv_z_slice = &mut self.inv_z[row + min_x..=row + max_x];
-                let color_slice = &mut self.color[row + min_x..=row + max_x];
-
-                let mut e0 = e0_row;
-                let mut e1 = e1_row;
-                let mut e2 = e2_row;
-                let mut iz = iz_row;
-                let mut entered = false;
-
-                for (iz_cell, col_cell) in inv_z_slice.iter_mut().zip(color_slice.iter_mut()) {
-                    if e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0 {
-                        entered = true;
-                        if iz > *iz_cell {
-                            *iz_cell = iz;
-                            *col_cell = solid_packed;
-                        }
-                    } else if entered {
-                        break;
-                    }
-                    e0 += dx0;
-                    e1 += dx1;
-                    e2 += dx2;
-                    iz += diz_dx;
-                }
-
-                e0_row += dy0;
-                e1_row += dy1;
-                e2_row += dy2;
-                iz_row += diz_dy;
-            }
-        }
-
-        true
+    let area = edge(sx0, sy0, sx1, sy1, sx2, sy2);
+    if area <= 0.0 {
+        return None;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn rasterize_view_tri_textured(
-        &mut self,
-        v0: ClipVert,
-        v1: ClipVert,
-        v2: ClipVert,
-        focal: f32,
-        tex: &Texture,
-        shade256: u32,
-        fog: FogParams,
-    ) -> bool {
-        let wf = self.width as f32;
-        let hf = self.height as f32;
-        let cx = wf * 0.5;
-        let cy = hf * 0.5;
+    let min_xf = sx0.min(sx1).min(sx2).floor();
+    let max_xf = sx0.max(sx1).max(sx2).ceil();
+    let min_yf = sy0.min(sy1).min(sy2).floor();
+    let max_yf = sy0.max(sy1).max(sy2).ceil();
 
-        let iz0 = 1.0 / v0.pos.z;
-        let iz1 = 1.0 / v1.pos.z;
-        let iz2 = 1.0 / v2.pos.z;
+    if max_xf < 0.0 || min_xf >= ctx.wf || max_yf < 0.0 || min_yf >= ctx.hf {
+        return None;
+    }
 
-        let sx0 = cx + v0.pos.x * iz0 * focal;
-        let sy0 = cy - v0.pos.y * iz0 * focal;
-        let sx1 = cx + v1.pos.x * iz1 * focal;
-        let sy1 = cy - v1.pos.y * iz1 * focal;
-        let sx2 = cx + v2.pos.x * iz2 * focal;
-        let sy2 = cy - v2.pos.y * iz2 * focal;
+    let min_x = min_xf.max(0.0) as usize;
+    let max_x = (max_xf as usize).min(ctx.width - 1);
+    let min_y = min_yf.max(0.0) as usize;
+    let max_y = (max_yf as usize).min(ctx.height - 1);
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
 
-        let area = edge(sx0, sy0, sx1, sy1, sx2, sy2);
-        if area <= 0.0 {
-            return false;
-        }
+    let start_px = min_x as f32 + 0.5;
+    let start_py = min_y as f32 + 0.5;
 
-        let min_xf = sx0.min(sx1).min(sx2).floor();
-        let max_xf = sx0.max(sx1).max(sx2).ceil();
-        let min_yf = sy0.min(sy1).min(sy2).floor();
-        let max_yf = sy0.max(sy1).max(sy2).ceil();
+    let e0_base = edge(sx1, sy1, sx2, sy2, start_px, start_py);
+    let e1_base = edge(sx2, sy2, sx0, sy0, start_px, start_py);
+    let e2_base = edge(sx0, sy0, sx1, sy1, start_px, start_py);
 
-        if max_xf < 0.0 || min_xf >= wf || max_yf < 0.0 || min_yf >= hf {
-            return false;
-        }
+    let dx0 = sy2 - sy1;
+    let dy0 = sx1 - sx2;
+    let dx1 = sy0 - sy2;
+    let dy1 = sx2 - sx0;
+    let dx2 = sy1 - sy0;
+    let dy2 = sx0 - sx1;
 
-        let min_x = min_xf.max(0.0) as usize;
-        let max_x = (max_xf as usize).min(self.width - 1);
-        let min_y = min_yf.max(0.0) as usize;
-        let max_y = (max_yf as usize).min(self.height - 1);
-        if min_x > max_x || min_y > max_y {
-            return false;
-        }
+    let inv_dx0 = if dx0.abs() > 1e-7 { 1.0 / dx0 } else { 0.0 };
+    let inv_dx1 = if dx1.abs() > 1e-7 { 1.0 / dx1 } else { 0.0 };
+    let inv_dx2 = if dx2.abs() > 1e-7 { 1.0 / dx2 } else { 0.0 };
 
-        let start_px = min_x as f32 + 0.5;
-        let start_py = min_y as f32 + 0.5;
+    let inv_area = 1.0 / area;
+    let iz_base = (e0_base * iz0 + e1_base * iz1 + e2_base * iz2) * inv_area;
+    let diz_dx = (dx0 * iz0 + dx1 * iz1 + dx2 * iz2) * inv_area;
+    let diz_dy = (dy0 * iz0 + dy1 * iz1 + dy2 * iz2) * inv_area;
 
-        let e0_row = edge(sx1, sy1, sx2, sy2, start_px, start_py);
-        let e1_row = edge(sx2, sy2, sx0, sy0, start_px, start_py);
-        let e2_row = edge(sx0, sy0, sx1, sy1, start_px, start_py);
-
-        let dx0 = sy2 - sy1;
-        let dy0 = sx1 - sx2;
-        let dx1 = sy0 - sy2;
-        let dy1 = sx2 - sx0;
-        let dx2 = sy1 - sy0;
-        let dy2 = sx0 - sx1;
-
-        let inv_area = 1.0 / area;
-        let iz_row = (e0_row * iz0 + e1_row * iz1 + e2_row * iz2) * inv_area;
-        let diz_dx = (dx0 * iz0 + dx1 * iz1 + dx2 * iz2) * inv_area;
-        let diz_dy = (dy0 * iz0 + dy1 * iz1 + dy2 * iz2) * inv_area;
-
+    let (uz_base, duz_dx, duz_dy, vz_base, dvz_dx, dvz_dy) = if tex_id != NO_TEX {
         let u0_iz = v0.uv[0] * iz0;
         let u1_iz = v1.uv[0] * iz1;
         let u2_iz = v2.uv[0] * iz2;
-        let uz_row = (e0_row * u0_iz + e1_row * u1_iz + e2_row * u2_iz) * inv_area;
-        let duz_dx = (dx0 * u0_iz + dx1 * u1_iz + dx2 * u2_iz) * inv_area;
-        let duz_dy = (dy0 * u0_iz + dy1 * u1_iz + dy2 * u2_iz) * inv_area;
+        let uz_b = (e0_base * u0_iz + e1_base * u1_iz + e2_base * u2_iz) * inv_area;
+        let duz_x = (dx0 * u0_iz + dx1 * u1_iz + dx2 * u2_iz) * inv_area;
+        let duz_y = (dy0 * u0_iz + dy1 * u1_iz + dy2 * u2_iz) * inv_area;
 
         let v0_iz = v0.uv[1] * iz0;
         let v1_iz = v1.uv[1] * iz1;
         let v2_iz = v2.uv[1] * iz2;
-        let vz_row = (e0_row * v0_iz + e1_row * v1_iz + e2_row * v2_iz) * inv_area;
-        let dvz_dx = (dx0 * v0_iz + dx1 * v1_iz + dx2 * v2_iz) * inv_area;
-        let dvz_dy = (dy0 * v0_iz + dy1 * v1_iz + dy2 * v2_iz) * inv_area;
+        let vz_b = (e0_base * v0_iz + e1_base * v1_iz + e2_base * v2_iz) * inv_area;
+        let dvz_x = (dx0 * v0_iz + dx1 * v1_iz + dx2 * v2_iz) * inv_area;
+        let dvz_y = (dy0 * v0_iz + dy1 * v1_iz + dy2 * v2_iz) * inv_area;
 
-        let need_fog = fog.enabled && v0.pos.z.max(v1.pos.z).max(v2.pos.z) > fog.start;
+        (uz_b, duz_x, duz_y, vz_b, dvz_x, dvz_y)
+    } else {
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    };
 
-        let span = TexSpan {
-            min_x,
-            max_x,
-            min_y,
-            max_y,
-            e0_row,
-            e1_row,
-            e2_row,
-            dx0,
-            dy0,
-            dx1,
-            dy1,
-            dx2,
-            dy2,
-            iz_row,
-            diz_dx,
-            diz_dy,
-            uz_row,
-            duz_dx,
-            duz_dy,
-            vz_row,
-            dvz_dx,
-            dvz_dy,
-        };
+    let need_fog = ctx.fog_enabled && v0.pos.z.max(v1.pos.z).max(v2.pos.z) > ctx.fog_start;
 
-        match (tex.pow2.is_some(), need_fog) {
-            (true, true) => self.scan_textured::<true, true>(span, tex, shade256, fog),
-            (true, false) => self.scan_textured::<true, false>(span, tex, shade256, fog),
-            (false, true) => self.scan_textured::<false, true>(span, tex, shade256, fog),
-            (false, false) => self.scan_textured::<false, false>(span, tex, shade256, fog),
+    Some(ProjectedTri {
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        e0_base,
+        e1_base,
+        e2_base,
+        dx0,
+        dy0,
+        inv_dx0,
+        dx1,
+        dy1,
+        inv_dx1,
+        dx2,
+        dy2,
+        inv_dx2,
+        iz_base,
+        diz_dx,
+        diz_dy,
+        uz_base,
+        duz_dx,
+        duz_dy,
+        vz_base,
+        dvz_dx,
+        dvz_dy,
+        sort_iz: iz0 + iz1 + iz2,
+        solid_packed,
+        shade256,
+        tex_id,
+        need_fog,
+    })
+}
+
+fn rasterize_band(
+    band: &mut Band<'_>,
+    projected: &[ProjectedTri],
+    textures: &[Texture],
+    fog: FogParams,
+) {
+    let band_rows = band.color.len() / band.width;
+    if band_rows == 0 {
+        return;
+    }
+    let band_y0 = band.y0;
+    let band_y1 = band_y0 + band_rows - 1;
+
+    for tri in projected {
+        if tri.max_y < band_y0 || tri.min_y > band_y1 {
+            continue;
         }
+        let y0 = tri.min_y.max(band_y0);
+        let y1 = tri.max_y.min(band_y1);
 
-        true
+        if tri.tex_id != NO_TEX {
+            let tex = &textures[tri.tex_id as usize];
+            match (tex.pow2.is_some(), tri.need_fog) {
+                (true, true) => scan_textured::<true, true>(band, y0, y1, tri, tex, fog),
+                (true, false) => scan_textured::<true, false>(band, y0, y1, tri, tex, fog),
+                (false, true) => scan_textured::<false, true>(band, y0, y1, tri, tex, fog),
+                (false, false) => scan_textured::<false, false>(band, y0, y1, tri, tex, fog),
+            }
+        } else if tri.need_fog {
+            scan_solid::<true>(band, y0, y1, tri, fog);
+        } else {
+            scan_solid::<false>(band, y0, y1, tri, fog);
+        }
+    }
+}
+
+/// Computes the exact covered horizontal pixel range `[x_start, x_end]` for one scanline
+/// by intersecting the three linear half-spaces `e_i + dx_i * t >= 0`.
+#[inline(always)]
+fn scanline_x_range(tri: &ProjectedTri, e0: f32, e1: f32, e2: f32) -> Option<(usize, usize)> {
+    let max_t = (tri.max_x - tri.min_x) as f32;
+    let mut t_lo = 0.0_f32;
+    let mut t_hi = max_t;
+
+    for (e, dx, inv_dx) in [
+        (e0, tri.dx0, tri.inv_dx0),
+        (e1, tri.dx1, tri.inv_dx1),
+        (e2, tri.dx2, tri.inv_dx2),
+    ] {
+        if dx > 1e-7 {
+            t_lo = t_lo.max(-e * inv_dx);
+        } else if dx < -1e-7 {
+            t_hi = t_hi.min(-e * inv_dx);
+        } else if e < 0.0 {
+            return None;
+        }
     }
 
-    fn scan_textured<const POW2: bool, const FOG: bool>(
-        &mut self,
-        mut s: TexSpan,
-        tex: &Texture,
-        shade256: u32,
-        fog: FogParams,
-    ) {
-        let (w_mask, h_mask, w_shift) = tex.pow2.unwrap_or((0, 0, 0));
-        let tw_i32 = tex.width as i32;
-        let th_i32 = tex.height as i32;
-        let tw = tex.width;
-        let pixels = &tex.pixels;
+    if t_lo > t_hi {
+        return None;
+    }
+    let i0 = t_lo.ceil().max(0.0) as usize;
+    let i1 = t_hi.floor().min(max_t) as usize;
+    if i0 > i1 {
+        return None;
+    }
+    Some((tri.min_x + i0, tri.min_x + i1))
+}
 
-        for y in s.min_y..=s.max_y {
-            let row = y * self.width;
-            let inv_z_slice = &mut self.inv_z[row + s.min_x..=row + s.max_x];
-            let color_slice = &mut self.color[row + s.min_x..=row + s.max_x];
+fn scan_solid<const FOG: bool>(
+    band: &mut Band<'_>,
+    y0: usize,
+    y1: usize,
+    tri: &ProjectedTri,
+    fog: FogParams,
+) {
+    let solid_packed = tri.solid_packed;
 
-            let mut e0 = s.e0_row;
-            let mut e1 = s.e1_row;
-            let mut e2 = s.e2_row;
-            let mut iz = s.iz_row;
-            let mut uz = s.uz_row;
-            let mut vz = s.vz_row;
-            let mut entered = false;
+    for y in y0..=y1 {
+        let dy = (y - tri.min_y) as f32;
+        let e0_row = tri.e0_base + tri.dy0 * dy;
+        let e1_row = tri.e1_base + tri.dy1 * dy;
+        let e2_row = tri.e2_base + tri.dy2 * dy;
+        if let Some((x_start, x_end)) = scanline_x_range(tri, e0_row, e1_row, e2_row) {
+            let iz_row = tri.iz_base + tri.diz_dy * dy;
+            let local_row = (y - band.y0) * band.width;
+            let inv_z_slice = &mut band.inv_z[local_row + x_start..=local_row + x_end];
+            let color_slice = &mut band.color[local_row + x_start..=local_row + x_end];
+            let mut iz = iz_row + tri.diz_dx * ((x_start - tri.min_x) as f32);
 
             for (iz_cell, col_cell) in inv_z_slice.iter_mut().zip(color_slice.iter_mut()) {
-                if e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0 {
-                    entered = true;
-                    if iz > *iz_cell {
-                        *iz_cell = iz;
-                        if FOG && iz <= fog.iz_far {
+                if iz > *iz_cell {
+                    *iz_cell = iz;
+                    *col_cell = if FOG {
+                        if iz >= fog.iz_near {
+                            solid_packed
+                        } else if iz <= fog.iz_far {
+                            fog.packed
+                        } else {
+                            let t256 = ((fog.iz_near - iz) * fog.inv_iz_span) as u32;
+                            lerp_packed(solid_packed, fog.packed, t256.min(256))
+                        }
+                    } else {
+                        solid_packed
+                    };
+                }
+                iz += tri.diz_dx;
+            }
+        }
+    }
+}
+
+fn scan_textured<const POW2: bool, const FOG: bool>(
+    band: &mut Band<'_>,
+    y0: usize,
+    y1: usize,
+    tri: &ProjectedTri,
+    tex: &Texture,
+    fog: FogParams,
+) {
+    let shade256 = tri.shade256;
+    let tw = tex.width;
+    let tw_i32 = tex.width as i32;
+    let th_i32 = tex.height as i32;
+
+    for y in y0..=y1 {
+        let dy = (y - tri.min_y) as f32;
+        let e0_row = tri.e0_base + tri.dy0 * dy;
+        let e1_row = tri.e1_base + tri.dy1 * dy;
+        let e2_row = tri.e2_base + tri.dy2 * dy;
+        if let Some((x_start, x_end)) = scanline_x_range(tri, e0_row, e1_row, e2_row) {
+            let iz_row = tri.iz_base + tri.diz_dy * dy;
+            let uz_row = tri.uz_base + tri.duz_dy * dy;
+            let vz_row = tri.vz_base + tri.dvz_dy * dy;
+            let local_row = (y - band.y0) * band.width;
+            let off = (x_start - tri.min_x) as f32;
+            let mut iz = iz_row + tri.diz_dx * off;
+            let mut uz = uz_row + tri.duz_dx * off;
+            let mut vz = vz_row + tri.dvz_dx * off;
+
+            let mut z0 = 1.0 / iz.max(1e-7);
+            let mut u0 = uz * z0;
+            let mut v0 = vz * z0;
+
+            let mut x = x_start;
+            let total_end = x_end + 1;
+            while x < total_end {
+                let remaining = total_end - x;
+                let chunk = remaining.min(SPAN_SIZE);
+                let end_x = x + chunk;
+
+                let (du, dv, next_state) = if remaining > SPAN_SIZE {
+                    let iz_n = iz + tri.diz_dx * (SPAN_SIZE as f32);
+                    let uz_n = uz + tri.duz_dx * (SPAN_SIZE as f32);
+                    let vz_n = vz + tri.dvz_dx * (SPAN_SIZE as f32);
+                    let z1 = 1.0 / iz_n.max(1e-7);
+                    let u1 = uz_n * z1;
+                    let v1 = vz_n * z1;
+                    (
+                        (u1 - u0) * INV_SPAN_SIZE,
+                        (v1 - v0) * INV_SPAN_SIZE,
+                        Some((iz_n, uz_n, vz_n, z1, u1, v1)),
+                    )
+                } else if chunk > 1 {
+                    let steps = (chunk - 1) as f32;
+                    let iz_e = iz + tri.diz_dx * steps;
+                    let uz_e = uz + tri.duz_dx * steps;
+                    let vz_e = vz + tri.dvz_dx * steps;
+                    let z1 = 1.0 / iz_e.max(1e-7);
+                    let u1 = uz_e * z1;
+                    let v1 = vz_e * z1;
+                    let inv_s = 1.0 / steps;
+                    ((u1 - u0) * inv_s, (v1 - v0) * inv_s, None)
+                } else {
+                    (0.0, 0.0, None)
+                };
+
+                // Pick mipmap level once per 16-pixel span from exact screen-space texel footprint.
+                let (pixels, w_mask, h_mask, w_shift, uv_shift) = if POW2 {
+                    let du_dy = (tri.duz_dy - u0 * tri.diz_dy) * z0;
+                    let dv_dy = (tri.dvz_dy - v0 * tri.diz_dy) * z0;
+                    let rho2 = (du * du + dv * dv).max(du_dy * du_dy + dv_dy * dv_dy);
+                    let mip = mip_from_rho2(rho2);
+                    let (px, wm, hm, ws, actual_mip) = tex.pow2_mip(mip);
+                    (px, wm, hm, ws, 16 + actual_mip)
+                } else {
+                    (tex.pixels.as_slice(), 0, 0, 0, 16)
+                };
+
+                // 48.16 fixed-point coordinates in i64: immune to large Doom map UV coordinates.
+                let mut u_fp = (u0 * 65536.0).floor() as i64;
+                let mut v_fp = (v0 * 65536.0).floor() as i64;
+                let du_fp = (du * 65536.0).round() as i64;
+                let dv_fp = (dv * 65536.0).round() as i64;
+
+                let inv_z_slice = &mut band.inv_z[local_row + x..local_row + end_x];
+                let color_slice = &mut band.color[local_row + x..local_row + end_x];
+                let mut cur_iz = iz;
+
+                for (iz_cell, col_cell) in inv_z_slice.iter_mut().zip(color_slice.iter_mut()) {
+                    if cur_iz > *iz_cell {
+                        *iz_cell = cur_iz;
+                        if FOG && cur_iz <= fog.iz_far {
                             *col_cell = fog.packed;
                         } else {
-                            let z = 1.0 / iz;
-                            let iu = fast_floor_i32(uz * z);
-                            let iv = fast_floor_i32(vz * z);
                             let idx = if POW2 {
-                                let tx = (iu as usize) & w_mask;
-                                let ty = (iv as usize) & h_mask;
+                                let tx = ((u_fp >> uv_shift) as usize) & w_mask;
+                                let ty = ((v_fp >> uv_shift) as usize) & h_mask;
                                 (ty << w_shift) | tx
                             } else {
-                                let tx = iu.rem_euclid(tw_i32) as usize;
-                                let ty = iv.rem_euclid(th_i32) as usize;
+                                let tx = ((u_fp >> 16) as i32).rem_euclid(tw_i32) as usize;
+                                let ty = ((v_fp >> 16) as i32).rem_euclid(th_i32) as usize;
                                 ty * tw + tx
                             };
                             let lit = scale_packed(pixels[idx], shade256);
-                            *col_cell = if FOG && iz < fog.iz_near {
-                                let t256 = ((fog.iz_near - iz) * fog.inv_iz_span) as u32;
+                            *col_cell = if FOG && cur_iz < fog.iz_near {
+                                let t256 = ((fog.iz_near - cur_iz) * fog.inv_iz_span) as u32;
                                 lerp_packed(lit, fog.packed, t256.min(256))
                             } else {
                                 lit
                             };
                         }
                     }
-                } else if entered {
-                    break;
+                    cur_iz += tri.diz_dx;
+                    u_fp = u_fp.wrapping_add(du_fp);
+                    v_fp = v_fp.wrapping_add(dv_fp);
                 }
-                e0 += s.dx0;
-                e1 += s.dx1;
-                e2 += s.dx2;
-                iz += s.diz_dx;
-                uz += s.duz_dx;
-                vz += s.dvz_dx;
-            }
 
-            s.e0_row += s.dy0;
-            s.e1_row += s.dy1;
-            s.e2_row += s.dy2;
-            s.iz_row += s.diz_dy;
-            s.uz_row += s.duz_dy;
-            s.vz_row += s.dvz_dy;
+                if let Some((iz_n, uz_n, vz_n, z1, u1, v1)) = next_state {
+                    iz = iz_n;
+                    uz = uz_n;
+                    vz = vz_n;
+                    z0 = z1;
+                    u0 = u1;
+                    v0 = v1;
+                }
+                x = end_x;
+            }
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct TexSpan {
-    min_x: usize,
-    max_x: usize,
-    min_y: usize,
-    max_y: usize,
-    e0_row: f32,
-    e1_row: f32,
-    e2_row: f32,
-    dx0: f32,
-    dy0: f32,
-    dx1: f32,
-    dy1: f32,
-    dx2: f32,
-    dy2: f32,
-    iz_row: f32,
-    diz_dx: f32,
-    diz_dy: f32,
-    uz_row: f32,
-    duz_dx: f32,
-    duz_dy: f32,
-    vz_row: f32,
-    dvz_dx: f32,
-    dvz_dy: f32,
+/// Fast `floor(log2(sqrt(rho2)))` using IEEE-754 exponent bits (zero transcendental calls).
+#[inline(always)]
+fn mip_from_rho2(rho2: f32) -> usize {
+    if rho2 <= 1.0 || !rho2.is_finite() {
+        return 0;
+    }
+    let exp = ((rho2.to_bits() >> 23) & 0xFF) as i32 - 127;
+    (exp >> 1).max(0) as usize
 }
 
 #[inline(always)]
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
     (px - ax) * (by - ay) - (py - ay) * (bx - ax)
-}
-
-#[inline(always)]
-fn fast_floor_i32(x: f32) -> i32 {
-    let i = x as i32;
-    i - ((x < i as f32) as i32)
 }
 
 #[inline(always)]
@@ -640,4 +772,87 @@ fn lerp_packed(a: u32, b: u32, t256: u32) -> u32 {
 #[inline(always)]
 fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::build_demo_room;
+
+    fn test_cam() -> Camera {
+        Camera {
+            pos: Vec3::new(0.0, 1.6, 4.0),
+            yaw: 0.0,
+            pitch: -0.08,
+            fov_y_rad: 60.0_f32.to_radians(),
+            near: 0.05,
+        }
+    }
+
+    fn test_cfg() -> RenderConfig {
+        RenderConfig {
+            debug_slivers: false,
+            textures_enabled: true,
+            fog_enabled: true,
+            fog_color: [16, 20, 26],
+            fog_start: 4.0,
+            fog_end: 20.0,
+            light_dir: Vec3::new(0.4, 0.8, 0.3).normalize(),
+        }
+    }
+
+    #[test]
+    fn multithreaded_bands_match_singlethreaded_bit_for_bit() {
+        let mut tris = build_demo_room();
+        let tex = Texture::new(
+            64,
+            64,
+            (0..64 * 64)
+                .map(|i| {
+                    let x = (i & 63) as u32;
+                    let y = (i >> 6) as u32;
+                    ((x * 4) << 16) | ((y * 4) << 8) | (((x ^ y) * 4) & 0xFF)
+                })
+                .collect(),
+        );
+        // Texture half of the room triangles with negative and large UVs to stress span + mip code.
+        for (idx, t) in tris.iter_mut().enumerate() {
+            if idx % 2 == 0 {
+                t.tex_id = 0;
+                t.uv0 = [-4000.0, -4000.0];
+                t.uv1 = [4000.0, -4000.0];
+                t.uv2 = [4000.0, 4000.0];
+                t.light = 220;
+            }
+        }
+
+        let cam = test_cam();
+        let cfg = test_cfg();
+
+        let mut fb_st = Framebuffer::new(320, 180);
+        fb_st.num_threads = 1;
+        fb_st.clear(cfg.fog_color);
+        let drawn_st = fb_st.draw_triangles(&tris, std::slice::from_ref(&tex), &cam, &cfg);
+
+        let mut fb_mt = Framebuffer::new(320, 180);
+        fb_mt.num_threads = 4;
+        fb_mt.clear(cfg.fog_color);
+        let drawn_mt = fb_mt.draw_triangles(&tris, std::slice::from_ref(&tex), &cam, &cfg);
+
+        assert!(drawn_st >= MT_TRI_THRESHOLD);
+        assert_eq!(drawn_st, drawn_mt);
+        assert_eq!(fb_st.color, fb_mt.color);
+        assert_eq!(fb_st.inv_z, fb_mt.inv_z);
+    }
+
+    #[test]
+    fn mip_selector_matches_expected_thresholds() {
+        assert_eq!(mip_from_rho2(0.25), 0);
+        assert_eq!(mip_from_rho2(1.0), 0);
+        assert_eq!(mip_from_rho2(3.9), 0);
+        assert_eq!(mip_from_rho2(4.0), 1);
+        assert_eq!(mip_from_rho2(16.0), 2);
+        assert_eq!(mip_from_rho2(64.0), 3);
+        assert_eq!(mip_from_rho2(f32::NAN), 0);
+    }
 }

@@ -10,7 +10,7 @@ mod view_bob;
 mod wad;
 
 use controller::{WalkConfig, Walker};
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, ScaleMode, Window, WindowOptions};  
 use raster::{Camera, Framebuffer, RenderConfig};
 use scene::{build_demo_room, build_playground, build_spinner, load_obj, tag_slivers};
 use sliver_math::Vec3;
@@ -27,9 +27,35 @@ const STEP: f32 = 1.0 / 120.0; // fixed physics timestep
 const EYE_HEIGHT: f32 = 1.65; // eye height above the floor
 const MOUSE_SENS: f32 = 0.0035;
 
+fn open_window(scale_2x: bool) -> Window {
+    let opts = WindowOptions {
+        scale: if scale_2x { Scale::X2 } else { Scale::X1 },
+        scale_mode: ScaleMode::AspectRatioStretch,
+        borderless: scale_2x,
+        title: !scale_2x,
+        resize: !scale_2x,
+        ..WindowOptions::default()
+    };
+    let mut win = Window::new("sliver_engine", W, H, opts).expect("Failed to create window");
+    if scale_2x {
+        win.set_position(0, 0);
+    }
+    win.set_target_fps(60);
+    win
+}
+
 fn main() {
-    let arg_path = env::args().nth(1);
-    let arg_map = env::args().nth(2);
+    let mut scale_2x = false;
+    let mut pos_args = Vec::new();
+    for arg in env::args().skip(1) {
+        if arg == "--2x" {
+            scale_2x = true;
+        } else {
+            pos_args.push(arg);
+        }
+    }
+    let arg_path = pos_args.first().cloned();
+    let arg_map = pos_args.get(1).cloned();
     let mut walk_cfg = WalkConfig::default();
     let (mut world_tris, world_textures, is_external_map, body_start, start_yaw, default_fog_end) =
         match arg_path {
@@ -82,17 +108,7 @@ fn main() {
     let mut thresh_idx = 2usize; // default threshold: 12 deg
     let mut sliver_count = tag_slivers(&mut world_tris, THRESHOLDS[thresh_idx]);
 
-    let mut window = Window::new(
-        "sliver_engine",
-        W,
-        H,
-        WindowOptions {
-            scale: Scale::X1,
-            ..WindowOptions::default()
-        },
-    )
-    .expect("Failed to create window");
-    window.set_target_fps(60);
+    let mut window = open_window(scale_2x);
 
     let mut fb = Framebuffer::new(W, H);
 
@@ -132,7 +148,7 @@ fn main() {
     let mut fps_frames = 0u32;
     let mut render_ms_acc = 0.0_f32;
 
-    println!("Controls: WASD move | Shift sprint | Space jump | Mouse drag or Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | F5 playground | Esc quit");
+    println!("Controls: WASD move | Shift sprint | Space jump | Mouse drag or Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | F5 playground | F6 slow-mo | F7 tex | F11 2x | Esc quit");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -187,6 +203,11 @@ fn main() {
         }
         if window.is_key_pressed(Key::F7, KeyRepeat::No) {
             cfg.textures_enabled = !cfg.textures_enabled;
+        }
+        if window.is_key_pressed(Key::F11, KeyRepeat::No) {
+            scale_2x = !scale_2x;
+            window = open_window(scale_2x);
+            last_mouse = None;
         }
         // Jump is a press edge, consumed by the first physics tick that runs.
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
@@ -316,7 +337,7 @@ fn main() {
             } else {
                 "FLAT"
             };
-            window.set_title(&format!(
+            let title = format!(
                 "sliver_engine | {:.0} FPS ({:.2} ms) | tris: {}/{} | slivers (<{}°): {} | [F1] {}",
                 fps,
                 avg_render_ms,
@@ -325,7 +346,11 @@ fn main() {
                 THRESHOLDS[thresh_idx],
                 sliver_count,
                 mode
-            ));
+            );
+            window.set_title(&title);
+            if scale_2x {
+                println!("{title}");
+            }
             fps_timer = 0.0;
             fps_frames = 0;
             render_ms_acc = 0.0;

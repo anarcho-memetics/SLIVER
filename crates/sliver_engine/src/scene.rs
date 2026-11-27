@@ -5,31 +5,117 @@ use std::path::Path;
 pub const NO_TEX: u16 = u16::MAX;
 
 #[derive(Clone, Debug)]
+pub struct MipLevel {
+    pub w_mask: usize,
+    pub h_mask: usize,
+    pub w_shift: u32,
+    pub pixels: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Texture {
     pub width: usize,
     pub height: usize,
-    /// Packed `0x00RRGGBB` texels in row-major order.
+    /// Packed `0x00RRGGBB` texels in row-major order (mip level 0).
     pub pixels: Vec<u32>,
     /// `(width - 1, height - 1, width.trailing_zeros())` when both dimensions are powers of two.
     pub pow2: Option<(usize, usize, u32)>,
+    /// Downsampled mip chain (levels 1..=N) for power-of-two textures.
+    pub mips: Vec<MipLevel>,
 }
 
 impl Texture {
     pub fn new(width: usize, height: usize, pixels: Vec<u32>) -> Self {
         debug_assert_eq!(pixels.len(), width * height);
-        let pow2 = if width > 0 && height > 0 && width.is_power_of_two() && height.is_power_of_two()
+        let pow2 = if width > 0
+            && height > 0
+            && width.is_power_of_two()
+            && height.is_power_of_two()
         {
             Some((width - 1, height - 1, width.trailing_zeros()))
         } else {
             None
         };
+
+        let mut mips: Vec<MipLevel> = Vec::new();
+        if pow2.is_some() {
+            let mut prev_w = width;
+            let mut prev_h = height;
+            // Stop once either side hits 1 so U and V scale uniformly by 2^-mip.
+            while prev_w > 1 && prev_h > 1 {
+                let nw = prev_w >> 1;
+                let nh = prev_h >> 1;
+                let next_pixels = {
+                    let src: &[u32] = match mips.last() {
+                        Some(lvl) => &lvl.pixels,
+                        None => &pixels,
+                    };
+                    let mut out = Vec::with_capacity(nw * nh);
+                    for y in 0..nh {
+                        let r0 = (y * 2) * prev_w;
+                        let r1 = r0 + prev_w;
+                        for x in 0..nw {
+                            let x0 = x * 2;
+                            out.push(avg4_packed(
+                                src[r0 + x0],
+                                src[r0 + x0 + 1],
+                                src[r1 + x0],
+                                src[r1 + x0 + 1],
+                            ));
+                        }
+                    }
+                    out
+                };
+                mips.push(MipLevel {
+                    w_mask: nw - 1,
+                    h_mask: nh - 1,
+                    w_shift: nw.trailing_zeros(),
+                    pixels: next_pixels,
+                });
+                prev_w = nw;
+                prev_h = nh;
+            }
+        }
+
         Self {
             width,
             height,
             pixels,
             pow2,
+            mips,
         }
     }
+
+    /// Returns `(pixels, w_mask, h_mask, w_shift, actual_mip)` for a power-of-two texture.
+    #[inline(always)]
+    pub fn pow2_mip(&self, requested: usize) -> (&[u32], usize, usize, u32, u32) {
+        if requested == 0 || self.mips.is_empty() {
+            let (wm, hm, ws) = self.pow2.unwrap_or((0, 0, 0));
+            (&self.pixels, wm, hm, ws, 0)
+        } else {
+            let idx = (requested - 1).min(self.mips.len() - 1);
+            let m = &self.mips[idx];
+            (&m.pixels, m.w_mask, m.h_mask, m.w_shift, (idx + 1) as u32)
+        }
+    }
+}
+
+#[inline]
+fn avg4_packed(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    let r = (((a >> 16) & 0xFF)
+        + ((b >> 16) & 0xFF)
+        + ((c >> 16) & 0xFF)
+        + ((d >> 16) & 0xFF)
+        + 2)
+        >> 2;
+    let g = (((a >> 8) & 0xFF)
+        + ((b >> 8) & 0xFF)
+        + ((c >> 8) & 0xFF)
+        + ((d >> 8) & 0xFF)
+        + 2)
+        >> 2;
+    let bl = ((a & 0xFF) + (b & 0xFF) + (c & 0xFF) + (d & 0xFF) + 2) >> 2;
+    (r << 16) | (g << 8) | bl
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -623,4 +709,39 @@ pub fn build_playground() -> Vec<Tri> {
     );
 
     tris
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generates_uniform_pow2_mipmap_chain() {
+        // 4x4 checkerboard of black (0x000000) and white (0xFFFFFF) -> mip 1 averages to 0x808080.
+        let mut pixels = Vec::with_capacity(16);
+        for y in 0..4 {
+            for x in 0..4 {
+                pixels.push(if (x + y) % 2 == 0 {
+                    0x00FF_FFFF
+                } else {
+                    0x0000_0000
+                });
+            }
+        }
+        let tex = Texture::new(4, 4, pixels);
+        assert_eq!(tex.mips.len(), 2); // 2x2 and 1x1
+        let (m1, wm1, hm1, ws1, lvl1) = tex.pow2_mip(1);
+        assert_eq!((wm1, hm1, ws1, lvl1), (1, 1, 1, 1));
+        assert_eq!(m1, &[0x0080_8080; 4]);
+        let (m2, wm2, hm2, ws2, lvl2) = tex.pow2_mip(9);
+        assert_eq!((wm2, hm2, ws2, lvl2), (0, 0, 0, 2));
+        assert_eq!(m2, &[0x0080_8080]);
+    }
+
+    #[test]
+    fn non_pow2_texture_skips_mipmaps() {
+        let tex = Texture::new(12, 6, vec![0x0011_2233; 72]);
+        assert!(tex.pow2.is_none());
+        assert!(tex.mips.is_empty());
+    }
 }
