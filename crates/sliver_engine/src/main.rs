@@ -3,6 +3,7 @@
 mod collision;
 mod controller;
 mod motion;
+mod perf;
 mod raster;
 mod raycast;
 mod scene;
@@ -10,7 +11,8 @@ mod view_bob;
 mod wad;
 
 use controller::{WalkConfig, Walker};
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, ScaleMode, Window, WindowOptions};  
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, ScaleMode, Window, WindowOptions};
+use perf::{FrameSample, PerfMonitor};
 use raster::{Camera, Framebuffer, RenderConfig};
 use scene::{build_demo_room, build_playground, build_spinner, load_obj, tag_slivers};
 use sliver_math::Vec3;
@@ -111,6 +113,7 @@ fn main() {
     let mut window = open_window(scale_2x);
 
     let mut fb = Framebuffer::new(W, H);
+    let mut perf = PerfMonitor::new();
 
     let eye_offset = Vec3::new(0.0, EYE_HEIGHT - walk_cfg.radius, 0.0);
     let mut walker = Walker::new(walk_cfg, body_start);
@@ -148,11 +151,13 @@ fn main() {
     let mut fps_frames = 0u32;
     let mut render_ms_acc = 0.0_f32;
 
-    println!("Controls: WASD move | Shift sprint | Space jump | Mouse drag or Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | F5 playground | F6 slow-mo | F7 tex | F11 2x | Esc quit");
+    println!("Controls: WASD move | Shift sprint | Space jump | Mouse drag or Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | F5 playground | F6 slow-mo | F7 tex | F9 perf | F11 2x | Esc quit");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
-        let dt = now.duration_since(last).as_secs_f32().min(0.05);
+        let raw_dt = now.duration_since(last).as_secs_f32();
+        let frame_ms = raw_dt * 1000.0;
+        let dt = raw_dt.min(0.05);
         last = now;
         elapsed += dt;
 
@@ -203,6 +208,11 @@ fn main() {
         }
         if window.is_key_pressed(Key::F7, KeyRepeat::No) {
             cfg.textures_enabled = !cfg.textures_enabled;
+        }
+        if window.is_key_pressed(Key::F9, KeyRepeat::No) {
+            perf.hud_enabled = !perf.hud_enabled;
+            perf.log_enabled = perf.hud_enabled;
+            println!("Perf monitor: {}", if perf.hud_enabled { "ON" } else { "OFF" });
         }
         if window.is_key_pressed(Key::F11, KeyRepeat::No) {
             scale_2x = !scale_2x;
@@ -270,7 +280,8 @@ fn main() {
         walker.sprinting =
             window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
 
-        // Fixed-timestep physics.
+        // 1) Fixed-timestep physics.
+        let t_phys = Instant::now();
         step_acc += if slow_mo { dt * 0.2 } else { dt };
         while step_acc >= STEP {
             step_acc -= STEP;
@@ -294,6 +305,7 @@ fn main() {
                 },
             );
         }
+        let phys_ms = t_phys.elapsed().as_secs_f32() * 1000.0;
 
         // Interpolate between the last two physics ticks to avoid 1-vs-2 tick stutter at 60 FPS.
         let alpha = (step_acc / STEP).clamp(0.0, 1.0);
@@ -314,16 +326,36 @@ fn main() {
             ..cam
         };
 
-        let t_render = Instant::now();
+        // 2) Clear framebuffer
+        let t_clear = Instant::now();
         fb.clear(cfg.fog_color);
+        let clear_ms = t_clear.elapsed().as_secs_f32() * 1000.0;
+
+        // 3) Rasterize
+        let t_rast = Instant::now();
         let mut drawn = fb.draw_triangles(&world_tris, &world_textures, &render_cam, &cfg);
         if !is_external_map {
             let spinner = build_spinner(elapsed * 1.1, Vec3::new(0.0, 2.5, -4.0));
             drawn += fb.draw_triangles(&spinner, &[], &render_cam, &cfg);
         }
-        render_ms_acc += t_render.elapsed().as_secs_f32() * 1000.0;
+        let rast_ms = t_rast.elapsed().as_secs_f32() * 1000.0;
+        render_ms_acc += clear_ms + rast_ms;
 
+        perf.draw_hud(&mut fb.color, W, H);
+
+        // 4) Present (includes minifb 60 FPS pacing sleep)
+        let t_pres = Instant::now();
         window.update_with_buffer(&fb.color, W, H).unwrap();
+        let present_ms = t_pres.elapsed().as_secs_f32() * 1000.0;
+
+        perf.push(FrameSample {
+            phys_ms,
+            clear_ms,
+            rast_ms,
+            present_ms,
+            frame_ms,
+        });
+        perf.maybe_log(drawn, world_tris.len());
 
         fps_timer += dt;
         fps_frames += 1;
@@ -337,16 +369,33 @@ fn main() {
             } else {
                 "FLAT"
             };
-            let title = format!(
-                "sliver_engine | {:.0} FPS ({:.2} ms) | tris: {}/{} | slivers (<{}°): {} | [F1] {}",
-                fps,
-                avg_render_ms,
-                drawn,
-                world_tris.len(),
-                THRESHOLDS[thresh_idx],
-                sliver_count,
-                mode
-            );
+            let title = if perf.hud_enabled {
+                let s = perf.summary();
+                format!(
+                    "sliver_engine | {:.0} FPS | work {:.2} ms (phys {:.2} clr {:.2} rast {:.2}) | p95 {:.1} max {:.1} | tris {}/{} | {}",
+                    fps,
+                    s.work_avg,
+                    s.phys_avg,
+                    s.clear_avg,
+                    s.rast_avg,
+                    s.frame_p95,
+                    s.frame_max,
+                    drawn,
+                    world_tris.len(),
+                    mode
+                )
+            } else {
+                format!(
+                    "sliver_engine | {:.0} FPS ({:.2} ms) | tris: {}/{} | slivers (<{}°): {} | [F1] {}",
+                    fps,
+                    avg_render_ms,
+                    drawn,
+                    world_tris.len(),
+                    THRESHOLDS[thresh_idx],
+                    sliver_count,
+                    mode
+                )
+            };
             window.set_title(&title);
             if scale_2x {
                 println!("{title}");
