@@ -16,7 +16,7 @@ use sliver_math::Vec3;
 use std::env;
 use std::path::Path;
 use std::time::Instant;
-use view_bob::ViewBob;
+use view_bob::{JumpFeedback, ViewBob};
 
 const W: usize = 960;
 const H: usize = 540;
@@ -71,6 +71,8 @@ fn main() {
     };
     let mut walker = Walker::new(walk_cfg, body_start);
     let mut bob = ViewBob::new();
+    let mut prev_body_pos = walker.pos;
+    let mut prev_bob = bob;
 
     let mut cam = Camera {
         pos: walker.pos + eye_offset,
@@ -92,6 +94,7 @@ fn main() {
     let mut step_acc = 0.0_f32;
     let mut jump_queued = false;
     let mut in_playground = false;
+    let mut slow_mo = false;
     let mut last_mouse: Option<(f32, f32)> = None;
 
     let mut last = Instant::now();
@@ -100,7 +103,7 @@ fn main() {
     let mut fps_frames = 0u32;
     let mut render_ms_acc = 0.0_f32;
 
-    println!("Controls: WASD move | Shift sprint | Space jump | Mouse drag or Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | Esc quit");
+    println!("Controls: WASD move | Shift sprint | Space jump | Mouse drag or Arrows/Q/E look | F1 sliver debug | F2 cycle threshold | F3 fog | F4 raycast | F5 playground | Esc quit");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
@@ -137,13 +140,21 @@ fn main() {
                 build_demo_room()
             };
             sliver_count = tag_slivers(&mut world_tris, THRESHOLDS[thresh_idx]);
-            walker.pos = if in_playground {
+            let spawn = if in_playground {
                 Vec3::new(0.0, walk_cfg.radius, 25.0)
             } else {
                 Vec3::new(0.0, walk_cfg.radius, 4.2)
             };
-            walker.vel = Vec3::ZERO;
+            walker = Walker::new(walk_cfg, spawn);
+            bob = ViewBob::new();
+            prev_body_pos = walker.pos;
+            prev_bob = bob;
+            jump_queued = false;
             cfg.fog_end = if in_playground { 48.0 } else { 20.0 };
+        }
+        if window.is_key_pressed(Key::F6, KeyRepeat::No) {
+            slow_mo = !slow_mo;
+            println!("Slow motion: {}", if slow_mo { "ON" } else { "OFF" });
         }
         // Jump is a press edge, consumed by the first physics tick that runs.
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
@@ -207,9 +218,11 @@ fn main() {
             window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
 
         // Fixed-timestep physics.
-        step_acc += dt;
+        step_acc += if slow_mo { dt * 0.2 } else { dt };
         while step_acc >= STEP {
             step_acc -= STEP;
+            prev_body_pos = walker.pos;
+            prev_bob = bob;
 
             walker.tick(&world_tris, STEP, wish_dir, jump_queued);
             jump_queued = false;
@@ -221,15 +234,27 @@ fn main() {
                 walker.cfg.max_speed,
                 walker.grounded,
                 walker.last_step_y,
+                JumpFeedback {
+                    crouch: walker.jump_crouch,
+                    just_jumped: walker.just_jumped,
+                    landing_speed: walker.last_landing_speed,
+                },
             );
         }
 
-        // The camera follows the body: eye offset + step smoothing + view bob.
+        // Interpolate between the last two physics ticks to avoid 1-vs-2 tick stutter at 60 FPS.
+        let alpha = (step_acc / STEP).clamp(0.0, 1.0);
+        let body_pos = prev_body_pos + (walker.pos - prev_body_pos) * alpha;
         let (right, _, _) = cam.basis();
-        cam.pos = walker.pos + eye_offset + bob.offset(right);
+        let prev_off = prev_bob.offset(right);
+        let curr_off = bob.offset(right);
+        cam.pos = body_pos + eye_offset + prev_off + (curr_off - prev_off) * alpha;
 
         // Render pass
-        let (bob_yaw, bob_pitch) = bob.angles();
+        let (prev_yaw, prev_pitch) = prev_bob.angles();
+        let (curr_yaw, curr_pitch) = bob.angles();
+        let bob_yaw = prev_yaw + (curr_yaw - prev_yaw) * alpha;
+        let bob_pitch = prev_pitch + (curr_pitch - prev_pitch) * alpha;
         let render_cam = Camera {
             yaw: cam.yaw + bob_yaw,
             pitch: (cam.pitch + bob_pitch).clamp(-1.45, 1.45),

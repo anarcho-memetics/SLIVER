@@ -16,6 +16,8 @@ const LEDGE_GRACE_TIME: f32 = 0.125;
 const MIN_STEP_GAIN: f32 = 0.02;
 /// Minimum push into a non-walkable surface to consider the body blocked by it.
 const BLOCK_MIN_SPEED: f32 = 0.1;
+/// Minimum alignment of horizontal `wish` into a riser to trigger step-up while sliding.
+const STEP_PUSH_MIN_DOT: f32 = 0.20;
 /// Static grip when standing still on a step edge: below this horizontal speed and above this normal.y,
 /// gravity is not allowed to roll the sphere off the ledge.
 const EDGE_GRIP_MAX_SPEED: f32 = 0.35;
@@ -27,6 +29,8 @@ const FAST_STEP_STUMBLE_LOSS: f32 = 0.08;
 pub struct WalkConfig {
     /// Body sphere radius. The capsule can replace it later without touching the engine pieces.
     pub radius: f32,
+    /// Brief pre-jump knee-compression delay before takeoff (seconds).
+    pub jump_windup: f32,
     pub gravity: f32,
     pub jump_speed: f32,
     pub max_speed: f32,
@@ -54,8 +58,9 @@ impl Default for WalkConfig {
     fn default() -> Self {
         Self {
             radius: 0.35,
-            gravity: 16.0,
-            jump_speed: 4.6,
+            gravity: 10.5,
+            jump_speed: 3.5,
+            jump_windup: 0.05,
             max_speed: 5.5,
             sprint_speed: 9.5,
             accel: 18.0,
@@ -106,15 +111,13 @@ fn try_step_up(
     tris: &[Tri],
     start: Vec3,
     vel_h: Vec3,
+    probe_dir: Vec3,
     dt: f32,
-    blocked_progress: f32,
+    blocked_along: f32,
 ) -> Option<(Vec3, f32)> {
-    let speed = vel_h.len();
-    if speed < 1e-4 {
+    if vel_h.len() < 1e-4 {
         return None;
     }
-    let dir = vel_h * (1.0 / speed);
-    let wanted = speed * dt;
     let probe = cfg.radius * 1.1;
     let mut scratch: Vec<Contact> = Vec::new();
 
@@ -133,11 +136,19 @@ fn try_step_up(
         return None;
     }
 
-    // 2) forward over the obstacle: must go clearly further than the blocked normal move did
-    let fwd = move_sphere(tris, up, cfg.radius, dir * probe, 1.0, &[], &mut scratch);
-    let probe_ratio = horizontal_len(up, fwd) / probe;
-    let blocked_ratio = (blocked_progress / wanted).min(1.0);
-    if probe_ratio < 0.75 || probe_ratio <= blocked_ratio {
+    // 2) forward perpendicular into the riser: must clear the obstacle rather than sliding along it
+    let fwd = move_sphere(
+        tris,
+        up,
+        cfg.radius,
+        probe_dir * probe,
+        1.0,
+        &[],
+        &mut scratch,
+    );
+    let fwd_along = (fwd - up).dot(probe_dir);
+    let probe_ratio = fwd_along / probe;
+    if probe_ratio < 0.75 || fwd_along <= blocked_along + 0.05 {
         return None;
     }
 
@@ -208,6 +219,13 @@ pub struct Walker {
     /// Vertical displacement TELEPORTED by a step this tick: positive when stepping up, negative when
     /// snapping down, 0.0 otherwise. Smooth physical motion is not included.
     pub last_step_y: f32,
+    /// 0.0..=1.0 progress of the pre-jump knee dip.
+    pub jump_crouch: f32,
+    /// True on the exact tick the jump impulse fires.
+    pub just_jumped: bool,
+    /// Downward impact speed (m/s) absorbed on the tick the walker lands.
+    pub last_landing_speed: f32,
+    jump_windup_rem: f32,
     prev_contacts: Vec<Contact>,
     /// True when this tick had a real walkable contact (or static edge grip).
     supported: bool,
@@ -225,6 +243,10 @@ impl Walker {
             sprinting: false,
             contacts: Vec::new(),
             last_step_y: 0.0,
+            jump_crouch: 0.0,
+            just_jumped: false,
+            last_landing_speed: 0.0,
+            jump_windup_rem: 0.0,
             prev_contacts: Vec::new(),
             supported: false,
             step_hold: 0,
@@ -249,15 +271,40 @@ impl Walker {
         let start = self.pos;
         let foot_y = start.y - cfg.radius;
         self.last_step_y = 0.0;
-
-        // Jump only from the ground (grounded comes from the previous tick).
-        let jumped = jump && self.grounded;
+        self.just_jumped = false;
+        self.last_landing_speed = 0.0;
+        // Jump only from the ground (grounded comes from the previous tick), with a brief
+        // knee-compression windup before applying the upward impulse.
+        let mut jumped = false;
+        if jump && self.grounded && self.jump_windup_rem <= 0.0 {
+            if cfg.jump_windup <= 0.0 {
+                jumped = true;
+            } else {
+                self.jump_windup_rem = cfg.jump_windup;
+            }
+        }
+        if self.jump_windup_rem > 0.0 {
+            if !self.grounded {
+                self.jump_windup_rem = 0.0;
+                self.jump_crouch = 0.0;
+            } else {
+                self.jump_windup_rem -= dt;
+                let denom = cfg.jump_windup.max(1e-4);
+                self.jump_crouch = (1.0 - (self.jump_windup_rem / denom)).clamp(0.0, 1.0);
+                if self.jump_windup_rem <= 0.0 {
+                    self.jump_windup_rem = 0.0;
+                    jumped = true;
+                }
+            }
+        }
         if jumped {
             self.vel.y = cfg.jump_speed;
             self.grounded = false;
             self.supported = false;
             self.step_hold = 0;
             self.ledge_grace = 0;
+            self.jump_crouch = 0.0;
+            self.just_jumped = true;
         }
 
         // Horizontal inertia only: it never touches vel.y. In the air it applies only while a direction
@@ -319,6 +366,9 @@ impl Walker {
                 .iter()
                 .any(|c| c.normal.y > EDGE_GRIP_MIN_NORMAL_Y && c.normal.y < 0.99)
         {
+            if !ground_like && vel_move.y < -1.0 {
+                self.last_landing_speed = -vel_move.y;
+            }
             self.pos = start;
             self.vel = Vec3::ZERO;
             self.supported = true;
@@ -330,29 +380,50 @@ impl Walker {
 
         // Step up: blocked by something non-walkable while supported and moving.
         if was_supported && !jumped && !holding {
-            let blocked = self
-                .contacts
-                .iter()
-                .any(|c| c.normal.y <= cfg.walkable_normal_y && c.impact_speed > BLOCK_MIN_SPEED);
-            if blocked {
-                let vel_h = Vec3::new(vel_move.x, 0.0, vel_move.z);
-                if let Some((pos, gain)) =
-                    try_step_up(&cfg, tris, start, vel_h, dt, horizontal_len(start, moved))
-                {
-                    let speed_ratio = (vel_h.len() / cfg.max_speed.max(1e-4)).clamp(0.0, 1.0);
-                    let stumble = FAST_STEP_STUMBLE_LOSS * speed_ratio * speed_ratio;
-                    let keep =
-                        (1.0 - cfg.step_speed_loss_per_meter * gain - stumble).clamp(0.4, 1.0);
-                    self.pos = pos;
-                    self.vel = Vec3::new(vel_h.x * keep, 0.0, vel_h.z * keep);
-                    self.contacts.clear();
-                    self.grounded = false;
-                    self.supported = false;
-                    self.ledge_grace = 0;
-                    self.step_hold = (STEP_HOLD_TIME / dt).ceil() as u32;
-                    self.last_step_y = gain;
-                    return;
+            let vel_h = Vec3::new(vel_move.x, 0.0, vel_move.z);
+            let wish_h = Vec3::new(wish.x, 0.0, wish.z);
+            let wish_len = wish_h.len();
+            let wish_dir = if wish_len > 1e-4 {
+                wish_h * (1.0 / wish_len)
+            } else {
+                Vec3::ZERO
+            };
+            let mut stepped = None;
+            for c in &self.contacts {
+                if c.normal.y > cfg.walkable_normal_y {
+                    continue;
                 }
+                let nh = Vec3::new(c.normal.x, 0.0, c.normal.z);
+                let nh_len = nh.len();
+                if nh_len < 1e-4 {
+                    continue;
+                }
+                let probe_dir = nh * (-1.0 / nh_len);
+                let pushing_into = wish_len > 1e-4 && wish_dir.dot(probe_dir) > STEP_PUSH_MIN_DOT;
+                if c.impact_speed <= BLOCK_MIN_SPEED && !pushing_into {
+                    continue;
+                }
+                let blocked_along = (moved - start).dot(probe_dir).max(0.0);
+                if let Some(res) =
+                    try_step_up(&cfg, tris, start, vel_h, probe_dir, dt, blocked_along)
+                {
+                    stepped = Some(res);
+                    break;
+                }
+            }
+            if let Some((pos, gain)) = stepped {
+                let speed_ratio = (vel_h.len() / cfg.max_speed.max(1e-4)).clamp(0.0, 1.0);
+                let stumble = FAST_STEP_STUMBLE_LOSS * speed_ratio * speed_ratio;
+                let keep = (1.0 - cfg.step_speed_loss_per_meter * gain - stumble).clamp(0.4, 1.0);
+                self.pos = pos;
+                self.vel = Vec3::new(vel_h.x * keep, 0.0, vel_h.z * keep);
+                self.contacts.clear();
+                self.grounded = false;
+                self.supported = false;
+                self.ledge_grace = 0;
+                self.step_hold = (STEP_HOLD_TIME / dt).ceil() as u32;
+                self.last_step_y = gain;
+                return;
             }
         }
 
@@ -368,6 +439,9 @@ impl Walker {
         }
 
         if supported_now {
+            if !ground_like && vy_before < -1.0 {
+                self.last_landing_speed = -vy_before;
+            }
             self.supported = true;
             self.grounded = true;
             self.ledge_grace = 0;
@@ -583,7 +657,15 @@ mod tests {
         }
         assert!(w.grounded);
 
+        // Start jump windup and advance until takeoff fires.
         w.tick(&tris, DT, Vec3::ZERO, true);
+        let max_ticks = (cfg.jump_windup / DT).ceil() as usize + 2;
+        let mut ticks = 1;
+        while !w.just_jumped && ticks < max_ticks {
+            w.tick(&tris, DT, Vec3::ZERO, false);
+            ticks += 1;
+        }
+        assert!(w.just_jumped, "jump did not fire within windup window");
         let expected = cfg.jump_speed - cfg.gravity * DT;
         assert!(!w.grounded);
         assert!((w.vel.y - expected).abs() < 1e-3);
@@ -811,6 +893,10 @@ mod tests {
         w.sprinting = true;
         let wish = Vec3::new(1.0, 0.0, 0.0);
 
+        // The first tick of a fresh Walker runs with `grounded == false` (the first floor contact is only
+        // registered at the end of that tick), so it accelerates with `air_accel` instead of `accel`.
+        // That costs at most one tick of ground acceleration: `+ 1` is the minimum that works, and
+        // `+ 2` leaves one tick of margin against f32 rounding.
         let ticks = (cfg.sprint_speed / (cfg.accel * DT)).ceil() as usize + 2;
         for _ in 0..ticks {
             w.tick(&tris, DT, wish, false);
@@ -819,6 +905,38 @@ mod tests {
             (w.vel.x - cfg.sprint_speed).abs() < 1e-3,
             "sprint speed: {}",
             w.vel.x
+        );
+    }
+    #[test]
+    fn climbs_a_step_approached_diagonally_without_sliding_stuck() {
+        let cfg = WalkConfig::default();
+        let mut tris = flat_floor();
+        push_block(
+            &mut tris,
+            Vec3::new(2.0, 0.0, -8.0),
+            Vec3::new(6.0, 0.20, 8.0),
+        );
+        let mut w = Walker::new(cfg, Vec3::new(1.2, cfg.radius, 0.0));
+        // ~55 degrees off the riser normal.
+        let wish = Vec3::new(0.57, 0.0, 0.82);
+        let wish = wish * (1.0 / wish.len());
+
+        let mut lifts = 0;
+        for _ in 0..250 {
+            w.tick(&tris, DT, wish, false);
+            if w.last_step_y > 0.0 {
+                lifts += 1;
+            }
+            if lifts > 0 && w.grounded && w.pos.x > 2.3 {
+                break;
+            }
+        }
+        assert_eq!(lifts, 1, "expected one diagonal step-up");
+        assert!(w.grounded);
+        assert!(
+            (w.pos.y - (cfg.radius + 0.20)).abs() < 0.01,
+            "height {}",
+            w.pos.y
         );
     }
 }
