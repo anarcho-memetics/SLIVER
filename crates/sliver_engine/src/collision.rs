@@ -1,5 +1,5 @@
 use crate::scene::Tri;
-use sliver_math::{sphere_triangle, SphereContact, Vec3};
+use sliver_math::{SphereContact, Vec3, sphere_triangle};
 
 /// Distance kept between the sphere and a surface after push-out.
 const SKIN: f32 = 1e-4;
@@ -35,10 +35,10 @@ pub struct Contact {
 fn deepest_contact(tris: &[Tri], center: Vec3, radius: f32) -> Option<(usize, SphereContact)> {
     let mut best: Option<(usize, SphereContact)> = None;
     for (i, t) in tris.iter().enumerate() {
-        if let Some(c) = sphere_triangle(center, radius, t.p0, t.p1, t.p2) {
-            if best.is_none_or(|(_, b)| c.depth > b.depth) {
-                best = Some((i, c));
-            }
+        if let Some(c) = sphere_triangle(center, radius, t.p0, t.p1, t.p2)
+            && best.is_none_or(|(_, b)| c.depth > b.depth)
+        {
+            best = Some((i, c));
         }
     }
     best

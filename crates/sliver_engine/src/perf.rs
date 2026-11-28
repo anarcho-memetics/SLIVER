@@ -158,11 +158,7 @@ impl PerfMonitor {
         }
 
         // Draw oldest -> newest from left to right.
-        let oldest = if self.filled < WINDOW {
-            0
-        } else {
-            self.cursor
-        };
+        let oldest = if self.filled < WINDOW { 0 } else { self.cursor };
         let to_px = |ms: f32| -> usize {
             ((ms / MAX_MS) * (GRAPH_H as f32))
                 .round()
@@ -198,6 +194,12 @@ impl PerfMonitor {
         for px in &mut color[row + x0..row + x0 + GRAPH_W] {
             *px = 0x00FF_FFFF;
         }
+    }
+}
+
+impl Default for PerfMonitor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

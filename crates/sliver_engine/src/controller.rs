@@ -3,8 +3,8 @@
 //! This is game-side policy built on the generic engine pieces (`collision.rs`, `motion.rs`).
 //! Nothing in those two files knows about players, floors, jumping or steps; it can move to the game repo.
 
-use crate::collision::{move_sphere, Contact};
-use crate::motion::{accelerate_toward, pre_move_friction_by, respond_by, ContactResponse};
+use crate::collision::{Contact, move_sphere};
+use crate::motion::{ContactResponse, accelerate_toward, pre_move_friction_by, respond_by};
 use crate::scene::Tri;
 use sliver_math::Vec3;
 

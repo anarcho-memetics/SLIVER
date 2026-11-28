@@ -232,11 +232,7 @@ mod tests {
         wall: &'a ContactResponse,
         c: &Contact,
     ) -> &'a ContactResponse {
-        if c.normal.y > 0.7 {
-            floor
-        } else {
-            wall
-        }
+        if c.normal.y > 0.7 { floor } else { wall }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::scene::Tri;
-use sliver_math::{ray_triangle, RayHit, Vec3};
+use sliver_math::{RayHit, Vec3, ray_triangle};
 
 /// Nearest hit of a ray against a triangle list (linear scan).
 /// `dir` should be normalized so `hit.t` is a real distance.
@@ -53,12 +53,14 @@ mod tests {
     #[test]
     fn t_max_limits_the_search() {
         let tris = build_demo_room();
-        assert!(raycast(
-            &tris,
-            Vec3::new(0.3, 1.8, 4.2),
-            Vec3::new(0.0, -1.0, 0.0),
-            1.0,
-        )
-        .is_none());
+        assert!(
+            raycast(
+                &tris,
+                Vec3::new(0.3, 1.8, 4.2),
+                Vec3::new(0.0, -1.0, 0.0),
+                1.0,
+            )
+            .is_none()
+        );
     }
 }

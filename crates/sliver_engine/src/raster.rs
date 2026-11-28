@@ -1,4 +1,4 @@
-use crate::scene::{Texture, Tri, NO_TEX, SKY_TEX};
+use crate::scene::{NO_TEX, SKY_TEX, Texture, Tri};
 use sliver_math::Vec3;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -227,10 +227,7 @@ impl BandPool {
                     let (projected, textures, sky_lut, fog, clear_packed) = {
                         let mut guard = shared_w.state.lock().unwrap();
                         while !guard.shutdown
-                            && guard
-                                .job
-                                .as_ref()
-                                .is_none_or(|j| j.generation == last_gen)
+                            && guard.job.as_ref().is_none_or(|j| j.generation == last_gen)
                         {
                             guard = shared_w.work_cv.wait(guard).unwrap();
                         }
@@ -579,11 +576,9 @@ impl Framebuffer {
         // Front-to-back sort (largest 1/z sum first) so nearer walls reject background overdraw.
         projected_vec.sort_unstable_by(|a, b| b.sort_iz.total_cmp(&a.sort_iz));
 
-        if has_sky {
-            if let Some(sky_id) = active_sky_tex {
-                let lut = Arc::make_mut(&mut self.sky_lut);
-                build_sky_lut(lut, sky_id, &textures[sky_id as usize], cam, &pctx);
-            }
+        if has_sky && let Some(sky_id) = active_sky_tex {
+            let lut = Arc::make_mut(&mut self.sky_lut);
+            build_sky_lut(lut, sky_id, &textures[sky_id as usize], cam, &pctx);
         }
 
         // Phase 2: rasterize horizontal bands in parallel using the persistent thread pool.
@@ -772,13 +767,7 @@ fn avg_rows_color(tex: &Texture, y_start: usize, y_end: usize) -> u32 {
         | (((b_sum + half) / count) as u32)
 }
 
-fn build_sky_lut(
-    lut: &mut SkyLut,
-    sky_tex_id: u16,
-    tex: &Texture,
-    cam: &Camera,
-    ctx: &ProjCtx,
-) {
+fn build_sky_lut(lut: &mut SkyLut, sky_tex_id: u16, tex: &Texture, cam: &Camera, ctx: &ProjCtx) {
     lut.tex_id = sky_tex_id;
     lut.u_cols.clear();
     lut.u_cols.reserve(ctx.width);

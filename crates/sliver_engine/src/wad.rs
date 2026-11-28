@@ -4,7 +4,7 @@
 //! `SSECTORS`, `NODES`, `SECTORS`) plus `PLAYPAL`, flats (`F_START..F_END`), `PNAMES`,
 //! and `TEXTURE1`/`TEXTURE2`, converting them into `Vec<Tri>`, `Vec<Texture>`, and Player 1 spawn.
 
-use crate::scene::{Texture, Tri, NO_TEX, SKY_TEX};
+use crate::scene::{NO_TEX, SKY_TEX, Texture, Tri};
 use sliver_math::Vec3;
 use std::collections::HashMap;
 use std::fs;
@@ -171,13 +171,13 @@ impl<'a> TexLoader<'a> {
         }
 
         let mut pnames = Vec::new();
-        if let Some(b) = pnames_data {
-            if b.len() >= 4 {
-                let count = read_i32(b, 0).max(0) as usize;
-                let max_entries = (b.len() - 4) / 8;
-                for i in 0..count.min(max_entries) {
-                    pnames.push(read_name8(b, 4 + i * 8));
-                }
+        if let Some(b) = pnames_data
+            && b.len() >= 4
+        {
+            let count = read_i32(b, 0).max(0) as usize;
+            let max_entries = (b.len() - 4) / 8;
+            for i in 0..count.min(max_entries) {
+                pnames.push(read_name8(b, 4 + i * 8));
             }
         }
 
@@ -1015,10 +1015,10 @@ fn subsector_sector(
         } else {
             ld.back
         };
-        if sd_idx != NO_SIDEDEF {
-            if let Some(sd) = sidedefs.get(sd_idx as usize) {
-                return Some(sd.sector as usize);
-            }
+        if sd_idx != NO_SIDEDEF
+            && let Some(sd) = sidedefs.get(sd_idx as usize)
+        {
+            return Some(sd.sector as usize);
         }
     }
     None
@@ -1036,7 +1036,9 @@ fn emit_subsector_flats(ctx: &mut BspBuildCtx<'_, '_>, ss_idx: usize, mut poly: 
     };
 
     let start = ss.first_seg as usize;
-    let end = start.saturating_add(ss.num_segs as usize).min(ctx.segs.len());
+    let end = start
+        .saturating_add(ss.num_segs as usize)
+        .min(ctx.segs.len());
     let ss_segs = &ctx.segs[start..end];
 
     // Clip the node polygon only by one-sided walls (void boundaries), using the parent
@@ -1182,7 +1184,10 @@ fn clip_poly_halfplane(
             let denom = d_prev - d_curr;
             if denom.abs() > 1e-12 {
                 let t = (d_prev / denom).clamp(0.0, 1.0);
-                let inter = (prev.0 + (curr.0 - prev.0) * t, prev.1 + (curr.1 - prev.1) * t);
+                let inter = (
+                    prev.0 + (curr.0 - prev.0) * t,
+                    prev.1 + (curr.1 - prev.1) * t,
+                );
                 push_dedup(&mut out, inter);
             }
         }
@@ -1204,10 +1209,10 @@ fn clip_poly_halfplane(
 }
 
 fn push_dedup(out: &mut Vec<(f64, f64)>, p: (f64, f64)) {
-    if let Some(&last) = out.last() {
-        if (p.0 - last.0).hypot(p.1 - last.1) < 1e-2 {
-            return;
-        }
+    if let Some(&last) = out.last()
+        && (p.0 - last.0).hypot(p.1 - last.1) < 1e-2
+    {
+        return;
     }
     out.push(p);
 }
@@ -1481,7 +1486,11 @@ mod tests {
 
         let floor_tris = map.tris.iter().filter(|t| t.normal().y > 0.99).count();
         let ceil_tris = map.tris.iter().filter(|t| t.normal().y < -0.99).count();
-        let wall_tris = map.tris.iter().filter(|t| t.normal().y.abs() < 0.01).count();
+        let wall_tris = map
+            .tris
+            .iter()
+            .filter(|t| t.normal().y.abs() < 0.01)
+            .count();
         assert_eq!(floor_tris, 2);
         assert_eq!(ceil_tris, 2);
         assert_eq!(wall_tris, 8);
@@ -1527,10 +1536,11 @@ mod tests {
         assert_eq!(map.textures[0].width, 64);
         assert_eq!(map.textures[0].height, 64);
         assert_eq!(map.textures[0].pixels[0], 0x000A_C81E);
-        assert!(map
-            .tris
-            .iter()
-            .any(|t| t.normal().y > 0.99 && t.tex_id == 0));
+        assert!(
+            map.tris
+                .iter()
+                .any(|t| t.normal().y > 0.99 && t.tex_id == 0)
+        );
     }
 
     #[test]

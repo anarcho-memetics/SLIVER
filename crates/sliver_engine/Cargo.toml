@@ -1,8 +1,17 @@
 [package]
 name = "sliver_engine"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:minifb"]
+
+[[bin]]
+name = "sliver_engine"
+path = "src/main.rs"
+required-features = ["desktop"]
 
 [dependencies]
 sliver_math = { path = "../sliver_math" }
-minifb = "0.27"
+minifb = { version = "0.27", optional = true }

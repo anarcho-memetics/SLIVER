@@ -28,10 +28,7 @@ pub struct Texture {
 impl Texture {
     pub fn new(width: usize, height: usize, pixels: Vec<u32>) -> Self {
         debug_assert_eq!(pixels.len(), width * height);
-        let pow2 = if width > 0
-            && height > 0
-            && width.is_power_of_two()
-            && height.is_power_of_two()
+        let pow2 = if width > 0 && height > 0 && width.is_power_of_two() && height.is_power_of_two()
         {
             Some((width - 1, height - 1, width.trailing_zeros()))
         } else {
@@ -103,18 +100,10 @@ impl Texture {
 
 #[inline]
 fn avg4_packed(a: u32, b: u32, c: u32, d: u32) -> u32 {
-    let r = (((a >> 16) & 0xFF)
-        + ((b >> 16) & 0xFF)
-        + ((c >> 16) & 0xFF)
-        + ((d >> 16) & 0xFF)
-        + 2)
+    let r = (((a >> 16) & 0xFF) + ((b >> 16) & 0xFF) + ((c >> 16) & 0xFF) + ((d >> 16) & 0xFF) + 2)
         >> 2;
-    let g = (((a >> 8) & 0xFF)
-        + ((b >> 8) & 0xFF)
-        + ((c >> 8) & 0xFF)
-        + ((d >> 8) & 0xFF)
-        + 2)
-        >> 2;
+    let g =
+        (((a >> 8) & 0xFF) + ((b >> 8) & 0xFF) + ((c >> 8) & 0xFF) + ((d >> 8) & 0xFF) + 2) >> 2;
     let bl = ((a & 0xFF) + (b & 0xFF) + (c & 0xFF) + (d & 0xFF) + 2) >> 2;
     (r << 16) | (g << 8) | bl
 }
@@ -515,16 +504,16 @@ pub fn load_obj(path: &Path) -> Result<Vec<Tri>, String> {
         } else if let Some(rest) = line.strip_prefix("f ") {
             let mut idx = Vec::new();
             for tok in rest.split_whitespace() {
-                if let Some(first) = tok.split('/').next() {
-                    if let Ok(raw) = first.parse::<isize>() {
-                        let resolved = if raw > 0 {
-                            (raw - 1) as usize
-                        } else {
-                            verts.len().saturating_sub((-raw) as usize)
-                        };
-                        if resolved < verts.len() {
-                            idx.push(resolved);
-                        }
+                if let Some(first) = tok.split('/').next()
+                    && let Ok(raw) = first.parse::<isize>()
+                {
+                    let resolved = if raw > 0 {
+                        (raw - 1) as usize
+                    } else {
+                        verts.len().saturating_sub((-raw) as usize)
+                    };
+                    if resolved < verts.len() {
+                        idx.push(resolved);
                     }
                 }
             }
