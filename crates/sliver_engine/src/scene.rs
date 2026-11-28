@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 pub const NO_TEX: u16 = u16::MAX;
+pub const SKY_TEX: u16 = u16::MAX - 1;
 
 #[derive(Clone, Debug)]
 pub struct MipLevel {

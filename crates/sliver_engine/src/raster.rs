@@ -1,4 +1,4 @@
-use crate::scene::{Texture, Tri, NO_TEX};
+use crate::scene::{Texture, Tri, NO_TEX, SKY_TEX};
 use sliver_math::Vec3;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -45,6 +45,7 @@ pub struct RenderConfig {
     pub fog_start: f32,
     pub fog_end: f32,
     pub light_dir: Vec3,
+    pub sky_tex_id: Option<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +75,27 @@ struct ProjCtx {
     focal: f32,
     fog_enabled: bool,
     fog_start: f32,
+}
+
+#[derive(Clone, Copy)]
+struct TriStyle {
+    tex_id: u16,
+    shade256: u32,
+    solid_packed: u32,
+    allow_fog: bool,
+}
+#[derive(Clone, Copy)]
+struct SkyRow {
+    tex_y: usize,
+    cap_color: u32,
+    fade256: u32,
+}
+
+#[derive(Clone, Default)]
+struct SkyLut {
+    tex_id: u16,
+    u_cols: Vec<usize>,
+    v_rows: Vec<SkyRow>,
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +151,15 @@ struct PoolJob {
     generation: u64,
     projected: Arc<Vec<ProjectedTri>>,
     textures: Arc<Vec<Texture>>,
+    sky_lut: Arc<SkyLut>,
+    fog: FogParams,
+    clear_packed: Option<u32>,
+}
+
+struct PoolPass<'a> {
+    projected: &'a Arc<Vec<ProjectedTri>>,
+    textures: &'a Arc<Vec<Texture>>,
+    sky_lut: &'a Arc<SkyLut>,
     fog: FogParams,
     clear_packed: Option<u32>,
 }
@@ -193,7 +224,7 @@ impl BandPool {
             let handle = thread::spawn(move || {
                 let mut last_gen = 0u64;
                 loop {
-                    let (projected, textures, fog, clear_packed) = {
+                    let (projected, textures, sky_lut, fog, clear_packed) = {
                         let mut guard = shared_w.state.lock().unwrap();
                         while !guard.shutdown
                             && guard
@@ -211,6 +242,7 @@ impl BandPool {
                         (
                             Arc::clone(&j.projected),
                             Arc::clone(&j.textures),
+                            Arc::clone(&j.sky_lut),
                             j.fog,
                             j.clear_packed,
                         )
@@ -229,12 +261,13 @@ impl BandPool {
                             width,
                             y0: band_y0,
                         };
-                        rasterize_band(&mut band, &projected, &textures, fog);
+                        rasterize_band(&mut band, &projected, &textures, &sky_lut, fog);
                     }
 
-                    // Drop Arc clones before signaling done so main thread's Arc::get_mut succeeds.
+                    // Drop Arc clones before signaling done so main thread's Arc::make_mut reuses buffers.
                     drop(projected);
                     drop(textures);
+                    drop(sky_lut);
 
                     let mut guard = shared_w.state.lock().unwrap();
                     guard.remaining -= 1;
@@ -258,15 +291,7 @@ impl BandPool {
         }
     }
 
-    fn dispatch(
-        &mut self,
-        color: &mut [u32],
-        inv_z: &mut [f32],
-        projected: &Arc<Vec<ProjectedTri>>,
-        textures: &Arc<Vec<Texture>>,
-        fog: FogParams,
-        clear_packed: Option<u32>,
-    ) {
+    fn dispatch(&mut self, color: &mut [u32], inv_z: &mut [f32], pass: PoolPass<'_>) {
         let n_workers = self.worker_bufs.len();
         if n_workers == 0 {
             let mut band = Band {
@@ -275,11 +300,17 @@ impl BandPool {
                 width: self.width,
                 y0: 0,
             };
-            rasterize_band(&mut band, projected, textures, fog);
+            rasterize_band(
+                &mut band,
+                pass.projected,
+                pass.textures,
+                pass.sky_lut,
+                pass.fog,
+            );
             return;
         }
 
-        if clear_packed.is_none() {
+        if pass.clear_packed.is_none() {
             for wb in &self.worker_bufs {
                 let mut b = wb.lock().unwrap();
                 let (s, e) = (b.px_start, b.px_end);
@@ -293,10 +324,11 @@ impl BandPool {
             let mut guard = self.shared.state.lock().unwrap();
             guard.job = Some(PoolJob {
                 generation: self.generation,
-                projected: Arc::clone(projected),
-                textures: Arc::clone(textures),
-                fog,
-                clear_packed,
+                projected: Arc::clone(pass.projected),
+                textures: Arc::clone(pass.textures),
+                sky_lut: Arc::clone(pass.sky_lut),
+                fog: pass.fog,
+                clear_packed: pass.clear_packed,
             });
             guard.remaining = n_workers;
             self.shared.work_cv.notify_all();
@@ -310,7 +342,13 @@ impl BandPool {
                 width: self.width,
                 y0: 0,
             };
-            rasterize_band(&mut band0, projected, textures, fog);
+            rasterize_band(
+                &mut band0,
+                pass.projected,
+                pass.textures,
+                pass.sky_lut,
+                pass.fog,
+            );
         }
 
         // Wait for all workers and drop the job's Arc clones.
@@ -351,6 +389,7 @@ pub struct Framebuffer {
     pub color: Vec<u32>,
     pub inv_z: Vec<f32>,
     projected: Arc<Vec<ProjectedTri>>,
+    sky_lut: Arc<SkyLut>,
     tex_cache_key: (usize, usize),
     tex_cache: Arc<Vec<Texture>>,
     clean_clear: Option<u32>,
@@ -370,6 +409,7 @@ impl Framebuffer {
             color: vec![0; width * height],
             inv_z: vec![0.0; width * height],
             projected: Arc::new(Vec::with_capacity(1024)),
+            sky_lut: Arc::new(SkyLut::default()),
             tex_cache_key: (0, 0),
             tex_cache: Arc::new(Vec::new()),
             clean_clear: None,
@@ -431,6 +471,17 @@ impl Framebuffer {
             fog_start: fog.start,
         };
 
+        let active_sky_tex = if cfg.textures_enabled && !cfg.debug_slivers {
+            cfg.sky_tex_id.filter(|&id| {
+                textures
+                    .get(id as usize)
+                    .is_some_and(|t| t.width > 0 && t.height > 0)
+            })
+        } else {
+            None
+        };
+        let mut has_sky = false;
+
         // Phase 1: cull, clip against near plane, shade, and project into a reusable buffer.
         let projected_vec = Arc::make_mut(&mut self.projected);
         projected_vec.clear();
@@ -460,7 +511,14 @@ impl Framebuffer {
             }
 
             let ndotl = n.dot(cfg.light_dir).max(0.0);
-            let tex_id = if cfg.textures_enabled
+            let is_sky_tri = tri.tex_id == SKY_TEX && !cfg.debug_slivers;
+            let tex_id = if is_sky_tri {
+                if active_sky_tex.is_some() {
+                    SKY_TEX
+                } else {
+                    NO_TEX
+                }
+            } else if cfg.textures_enabled
                 && !cfg.debug_slivers
                 && tri.tex_id != NO_TEX
                 && (tri.tex_id as usize) < textures.len()
@@ -470,7 +528,11 @@ impl Framebuffer {
                 NO_TEX
             };
 
-            let (shade256, solid_packed) = if tex_id != NO_TEX {
+            let (shade256, solid_packed) = if tex_id == SKY_TEX {
+                (256, 0)
+            } else if is_sky_tri {
+                (256, pack_rgb(tri.color[0], tri.color[1], tri.color[2]))
+            } else if tex_id != NO_TEX {
                 let light_norm = (tri.light as f32) / 255.0;
                 let sector_scale = 0.22 + 0.78 * light_norm;
                 let dir_shade = (0.74 + 0.08 * (n.y * 0.5 + 0.5) + 0.18 * ndotl).min(1.0);
@@ -492,10 +554,18 @@ impl Framebuffer {
                 (256, pack_rgb(lit[0], lit[1], lit[2]))
             };
 
+            let style = TriStyle {
+                tex_id,
+                shade256,
+                solid_packed,
+                allow_fog: !is_sky_tri,
+            };
+
             for c in &clipped[..count] {
-                if let Some(proj) =
-                    project_tri(c.0, c.1, c.2, &pctx, tex_id, shade256, solid_packed)
-                {
+                if let Some(proj) = project_tri(c.0, c.1, c.2, &pctx, style) {
+                    if tex_id == SKY_TEX {
+                        has_sky = true;
+                    }
                     projected_vec.push(proj);
                 }
             }
@@ -509,6 +579,13 @@ impl Framebuffer {
         // Front-to-back sort (largest 1/z sum first) so nearer walls reject background overdraw.
         projected_vec.sort_unstable_by(|a, b| b.sort_iz.total_cmp(&a.sort_iz));
 
+        if has_sky {
+            if let Some(sky_id) = active_sky_tex {
+                let lut = Arc::make_mut(&mut self.sky_lut);
+                build_sky_lut(lut, sky_id, &textures[sky_id as usize], cam, &pctx);
+            }
+        }
+
         // Phase 2: rasterize horizontal bands in parallel using the persistent thread pool.
         let width = self.width;
         let height = self.height;
@@ -519,10 +596,10 @@ impl Framebuffer {
             let mut band = Band {
                 color: &mut self.color,
                 inv_z: &mut self.inv_z,
-                width: self.width,
+                width,
                 y0: 0,
             };
-            rasterize_band(&mut band, &self.projected, textures, fog);
+            rasterize_band(&mut band, &self.projected, textures, &self.sky_lut, fog);
         } else {
             let tex_arc = self.cached_textures(textures);
             let need_init = self
@@ -536,10 +613,13 @@ impl Framebuffer {
                 pool.dispatch(
                     &mut self.color,
                     &mut self.inv_z,
-                    &self.projected,
-                    &tex_arc,
-                    fog,
-                    clear_packed,
+                    PoolPass {
+                        projected: &self.projected,
+                        textures: &tex_arc,
+                        sky_lut: &self.sky_lut,
+                        fog,
+                        clear_packed,
+                    },
                 );
             }
         }
@@ -553,9 +633,7 @@ fn project_tri(
     v1: ClipVert,
     v2: ClipVert,
     ctx: &ProjCtx,
-    tex_id: u16,
-    shade256: u32,
-    solid_packed: u32,
+    style: TriStyle,
 ) -> Option<ProjectedTri> {
     let iz0 = 1.0 / v0.pos.z;
     let iz1 = 1.0 / v1.pos.z;
@@ -613,27 +691,29 @@ fn project_tri(
     let diz_dx = (dx0 * iz0 + dx1 * iz1 + dx2 * iz2) * inv_area;
     let diz_dy = (dy0 * iz0 + dy1 * iz1 + dy2 * iz2) * inv_area;
 
-    let (uz_base, duz_dx, duz_dy, vz_base, dvz_dx, dvz_dy) = if tex_id != NO_TEX {
-        let u0_iz = v0.uv[0] * iz0;
-        let u1_iz = v1.uv[0] * iz1;
-        let u2_iz = v2.uv[0] * iz2;
-        let uz_b = (e0_base * u0_iz + e1_base * u1_iz + e2_base * u2_iz) * inv_area;
-        let duz_x = (dx0 * u0_iz + dx1 * u1_iz + dx2 * u2_iz) * inv_area;
-        let duz_y = (dy0 * u0_iz + dy1 * u1_iz + dy2 * u2_iz) * inv_area;
+    let (uz_base, duz_dx, duz_dy, vz_base, dvz_dx, dvz_dy) =
+        if style.tex_id != NO_TEX && style.tex_id != SKY_TEX {
+            let u0_iz = v0.uv[0] * iz0;
+            let u1_iz = v1.uv[0] * iz1;
+            let u2_iz = v2.uv[0] * iz2;
+            let uz_b = (e0_base * u0_iz + e1_base * u1_iz + e2_base * u2_iz) * inv_area;
+            let duz_x = (dx0 * u0_iz + dx1 * u1_iz + dx2 * u2_iz) * inv_area;
+            let duz_y = (dy0 * u0_iz + dy1 * u1_iz + dy2 * u2_iz) * inv_area;
 
-        let v0_iz = v0.uv[1] * iz0;
-        let v1_iz = v1.uv[1] * iz1;
-        let v2_iz = v2.uv[1] * iz2;
-        let vz_b = (e0_base * v0_iz + e1_base * v1_iz + e2_base * v2_iz) * inv_area;
-        let dvz_x = (dx0 * v0_iz + dx1 * v1_iz + dx2 * v2_iz) * inv_area;
-        let dvz_y = (dy0 * v0_iz + dy1 * v1_iz + dy2 * v2_iz) * inv_area;
+            let v0_iz = v0.uv[1] * iz0;
+            let v1_iz = v1.uv[1] * iz1;
+            let v2_iz = v2.uv[1] * iz2;
+            let vz_b = (e0_base * v0_iz + e1_base * v1_iz + e2_base * v2_iz) * inv_area;
+            let dvz_x = (dx0 * v0_iz + dx1 * v1_iz + dx2 * v2_iz) * inv_area;
+            let dvz_y = (dy0 * v0_iz + dy1 * v1_iz + dy2 * v2_iz) * inv_area;
 
-        (uz_b, duz_x, duz_y, vz_b, dvz_x, dvz_y)
-    } else {
-        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    };
+            (uz_b, duz_x, duz_y, vz_b, dvz_x, dvz_y)
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        };
 
-    let need_fog = ctx.fog_enabled && v0.pos.z.max(v1.pos.z).max(v2.pos.z) > ctx.fog_start;
+    let need_fog =
+        style.allow_fog && ctx.fog_enabled && v0.pos.z.max(v1.pos.z).max(v2.pos.z) > ctx.fog_start;
 
     Some(ProjectedTri {
         min_x,
@@ -662,17 +742,122 @@ fn project_tri(
         dvz_dx,
         dvz_dy,
         sort_iz: iz0 + iz1 + iz2,
-        solid_packed,
-        shade256,
-        tex_id,
+        solid_packed: style.solid_packed,
+        shade256: style.shade256,
+        tex_id: style.tex_id,
         need_fog,
     })
+}
+
+fn avg_rows_color(tex: &Texture, y_start: usize, y_end: usize) -> u32 {
+    let mut r_sum = 0u64;
+    let mut g_sum = 0u64;
+    let mut b_sum = 0u64;
+    let mut count = 0u64;
+    for y in y_start..y_end {
+        let off = y * tex.width;
+        for &c in &tex.pixels[off..off + tex.width] {
+            r_sum += ((c >> 16) & 0xFF) as u64;
+            g_sum += ((c >> 8) & 0xFF) as u64;
+            b_sum += (c & 0xFF) as u64;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 0;
+    }
+    let half = count / 2;
+    (((r_sum + half) / count) as u32) << 16
+        | (((g_sum + half) / count) as u32) << 8
+        | (((b_sum + half) / count) as u32)
+}
+
+fn build_sky_lut(
+    lut: &mut SkyLut,
+    sky_tex_id: u16,
+    tex: &Texture,
+    cam: &Camera,
+    ctx: &ProjCtx,
+) {
+    lut.tex_id = sky_tex_id;
+    lut.u_cols.clear();
+    lut.u_cols.reserve(ctx.width);
+    lut.v_rows.clear();
+    lut.v_rows.reserve(ctx.height);
+
+    let inv_focal = 1.0 / ctx.focal;
+    let tw = tex.width as i32;
+
+    // Classic Doom maps 1024 sky texels to 360 deg (4x wrap for 256-wide, 2x for 512, 1x for 1024).
+    let u_scale = 1024.0 / std::f32::consts::TAU;
+    for x in 0..ctx.width {
+        let angle_x = cam.yaw + ((x as f32 + 0.5 - ctx.cx) * inv_focal).atan();
+        let u = (angle_x * u_scale).floor() as i32;
+        lut.u_cols.push(u.rem_euclid(tw) as usize);
+    }
+
+    // Horizon at ~100/128 of texture height with classic 4:3 aspect (~136 texels/rad).
+    // Fade the top/bottom edges into their average cap color so mouselook never stretches row 0.
+    let th_f = tex.height as f32;
+    let horizon_v = th_f * (100.0 / 128.0);
+    let v_scale = th_f * (136.0 / 128.0);
+    let max_v = tex.height - 1;
+    let max_v_i = max_v as i32;
+    let max_v_f = max_v as f32;
+
+    let cap_rows = (tex.height / 32).clamp(1, 4).min(tex.height);
+    let top_cap = avg_rows_color(tex, 0, cap_rows);
+    let bot_cap = avg_rows_color(tex, tex.height - cap_rows, tex.height);
+    let top_fade = (th_f * 0.22).max(1.0);
+    let bot_fade = (th_f * 0.08).max(1.0);
+
+    for y in 0..ctx.height {
+        let elev = cam.pitch + ((ctx.cy - (y as f32 + 0.5)) * inv_focal).atan();
+        let v_f = horizon_v - elev * v_scale;
+        let row = if v_f <= 0.0 {
+            SkyRow {
+                tex_y: 0,
+                cap_color: top_cap,
+                fade256: 256,
+            }
+        } else if v_f < top_fade {
+            let t = 1.0 - v_f / top_fade;
+            let smooth = t * t * (3.0 - 2.0 * t);
+            SkyRow {
+                tex_y: (v_f.floor() as i32).clamp(0, max_v_i) as usize,
+                cap_color: top_cap,
+                fade256: (smooth * 256.0).round().clamp(0.0, 256.0) as u32,
+            }
+        } else if v_f >= max_v_f {
+            SkyRow {
+                tex_y: max_v,
+                cap_color: bot_cap,
+                fade256: 256,
+            }
+        } else if v_f > max_v_f - bot_fade {
+            let t = 1.0 - (max_v_f - v_f) / bot_fade;
+            let smooth = t * t * (3.0 - 2.0 * t);
+            SkyRow {
+                tex_y: (v_f.floor() as i32).clamp(0, max_v_i) as usize,
+                cap_color: bot_cap,
+                fade256: (smooth * 256.0).round().clamp(0.0, 256.0) as u32,
+            }
+        } else {
+            SkyRow {
+                tex_y: (v_f.floor() as i32).clamp(0, max_v_i) as usize,
+                cap_color: 0,
+                fade256: 0,
+            }
+        };
+        lut.v_rows.push(row);
+    }
 }
 
 fn rasterize_band(
     band: &mut Band<'_>,
     projected: &[ProjectedTri],
     textures: &[Texture],
+    sky_lut: &SkyLut,
     fog: FogParams,
 ) {
     let band_rows = band.color.len() / band.width;
@@ -689,7 +874,10 @@ fn rasterize_band(
         let y0 = tri.min_y.max(band_y0);
         let y1 = tri.max_y.min(band_y1);
 
-        if tri.tex_id != NO_TEX {
+        if tri.tex_id == SKY_TEX {
+            let tex = &textures[sky_lut.tex_id as usize];
+            scan_sky(band, y0, y1, tri, tex, sky_lut);
+        } else if tri.tex_id != NO_TEX {
             let tex = &textures[tri.tex_id as usize];
             match (tex.pow2.is_some(), tri.need_fog) {
                 (true, true) => scan_textured::<true, true>(band, y0, y1, tri, tex, fog),
@@ -736,6 +924,73 @@ fn scanline_x_range(tri: &ProjectedTri, e0: f32, e1: f32, e2: f32) -> Option<(us
         return None;
     }
     Some((tri.min_x + i0, tri.min_x + i1))
+}
+
+fn scan_sky(
+    band: &mut Band<'_>,
+    y0: usize,
+    y1: usize,
+    tri: &ProjectedTri,
+    tex: &Texture,
+    sky_lut: &SkyLut,
+) {
+    let tw = tex.width;
+    for y in y0..=y1 {
+        let dy = (y - tri.min_y) as f32;
+        let e0_row = tri.e0_base + tri.dy0 * dy;
+        let e1_row = tri.e1_base + tri.dy1 * dy;
+        let e2_row = tri.e2_base + tri.dy2 * dy;
+        if let Some((x_start, x_end)) = scanline_x_range(tri, e0_row, e1_row, e2_row) {
+            let iz_row = tri.iz_base + tri.diz_dy * dy;
+            let local_row = (y - band.y0) * band.width;
+            let inv_z_slice = &mut band.inv_z[local_row + x_start..=local_row + x_end];
+            let color_slice = &mut band.color[local_row + x_start..=local_row + x_end];
+            let sky_row = sky_lut.v_rows[y];
+            let mut iz = iz_row + tri.diz_dx * ((x_start - tri.min_x) as f32);
+
+            if sky_row.fade256 >= 256 {
+                let cap = sky_row.cap_color;
+                for (iz_cell, col_cell) in inv_z_slice.iter_mut().zip(color_slice.iter_mut()) {
+                    if iz > *iz_cell {
+                        *iz_cell = iz;
+                        *col_cell = cap;
+                    }
+                    iz += tri.diz_dx;
+                }
+            } else {
+                let u_slice = &sky_lut.u_cols[x_start..=x_end];
+                let row_off = sky_row.tex_y * tw;
+                let row_pixels = &tex.pixels[row_off..row_off + tw];
+                if sky_row.fade256 == 0 {
+                    for ((iz_cell, col_cell), &tx) in inv_z_slice
+                        .iter_mut()
+                        .zip(color_slice.iter_mut())
+                        .zip(u_slice.iter())
+                    {
+                        if iz > *iz_cell {
+                            *iz_cell = iz;
+                            *col_cell = row_pixels[tx];
+                        }
+                        iz += tri.diz_dx;
+                    }
+                } else {
+                    let cap = sky_row.cap_color;
+                    let fade = sky_row.fade256;
+                    for ((iz_cell, col_cell), &tx) in inv_z_slice
+                        .iter_mut()
+                        .zip(color_slice.iter_mut())
+                        .zip(u_slice.iter())
+                    {
+                        if iz > *iz_cell {
+                            *iz_cell = iz;
+                            *col_cell = lerp_packed(row_pixels[tx], cap, fade);
+                        }
+                        iz += tri.diz_dx;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn scan_solid<const FOG: bool>(
@@ -1041,6 +1296,7 @@ mod tests {
             fog_start: 4.0,
             fog_end: 20.0,
             light_dir: Vec3::new(0.4, 0.8, 0.3).normalize(),
+            sky_tex_id: None,
         }
     }
 
@@ -1086,6 +1342,64 @@ mod tests {
         assert_eq!(drawn_st, drawn_mt);
         assert_eq!(fb_st.color, fb_mt.color);
         assert_eq!(fb_st.inv_z, fb_mt.inv_z);
+    }
+
+    #[test]
+    fn sky_triangles_draw_panorama_and_occlude_behind() {
+        let sky_color = 0x0044_88CC;
+        let sky_tex = Texture::new(64, 64, vec![sky_color; 64 * 64]);
+
+        // Closer sky quad at z = -2 occluding a farther red wall at z = -6.
+        let tris = vec![
+            Tri::new_textured(
+                Vec3::new(-2.0, -2.0, -2.0),
+                Vec3::new(2.0, -2.0, -2.0),
+                Vec3::new(2.0, 2.0, -2.0),
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [100, 140, 180],
+                SKY_TEX,
+                255,
+            ),
+            Tri::new_textured(
+                Vec3::new(-2.0, -2.0, -2.0),
+                Vec3::new(2.0, 2.0, -2.0),
+                Vec3::new(-2.0, 2.0, -2.0),
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [100, 140, 180],
+                SKY_TEX,
+                255,
+            ),
+            Tri::new(
+                Vec3::new(-4.0, -4.0, -6.0),
+                Vec3::new(4.0, -4.0, -6.0),
+                Vec3::new(4.0, 4.0, -6.0),
+                [255, 0, 0],
+            ),
+        ];
+
+        let cam = Camera {
+            pos: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            fov_y_rad: 60.0_f32.to_radians(),
+            near: 0.1,
+        };
+        let mut cfg = test_cfg();
+        cfg.fog_start = 0.5;
+        cfg.fog_end = 1.5; // Beyond fog_end: sky must still stay un-fogged.
+        cfg.sky_tex_id = Some(0);
+
+        let mut fb = Framebuffer::new(120, 80);
+        fb.clear(cfg.fog_color);
+        fb.draw_triangles(&tris, std::slice::from_ref(&sky_tex), &cam, &cfg);
+
+        let center = (80 / 2) * 120 + (120 / 2);
+        assert_eq!(fb.color[center], sky_color);
+        assert!(fb.inv_z[center] > 0.45);
     }
 
     #[test]

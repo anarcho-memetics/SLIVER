@@ -59,13 +59,16 @@ fn main() {
     let arg_path = pos_args.first().cloned();
     let arg_map = pos_args.get(1).cloned();
     let mut walk_cfg = WalkConfig::default();
-    let (mut world_tris, world_textures, is_external_map, body_start, start_yaw, default_fog_end) =
+    let mut eye_height = EYE_HEIGHT;
+    let (mut world_tris, world_textures, sky_tex_id, is_external_map, body_start, start_yaw, default_fog_end) =
         match arg_path {
             Some(ref p) if p.to_ascii_lowercase().ends_with(".wad") => {
                 match wad::load_wad_map(Path::new(p), arg_map.as_deref()) {
                     Ok(map) => {
-                        // Doom's MAXSTEPHEIGHT is 24 map units (~0.67 m at 1/36 scale).
-                        walk_cfg.max_step_height = 0.70;
+                        // Doom's MAXSTEPHEIGHT is 24 units (0.80 m at 1.2/36 Y scale)
+                        // and VIEWHEIGHT is 41 units (~1.37 m).
+                        walk_cfg.max_step_height = 0.82;
+                        eye_height = 41.0 * (1.2 / 36.0);
                         println!(
                             "Loaded {p} ({}): {} triangles, {} textures",
                             map.name,
@@ -75,6 +78,7 @@ fn main() {
                         (
                             map.tris,
                             map.textures,
+                            map.sky_tex_id,
                             true,
                             map.spawn_pos + Vec3::new(0.0, walk_cfg.radius, 0.0),
                             map.spawn_yaw,
@@ -90,7 +94,7 @@ fn main() {
             Some(ref p) => match load_obj(Path::new(p)) {
                 Ok(tris) => {
                     println!("Loaded {p}: {} triangles", tris.len());
-                    (tris, Vec::new(), true, Vec3::new(0.0, 1.5, 8.0), 0.0, 20.0)
+                    (tris, Vec::new(), None, true, Vec3::new(0.0, 1.5, 8.0), 0.0, 20.0)
                 }
                 Err(e) => {
                     eprintln!("{e}");
@@ -100,6 +104,7 @@ fn main() {
             None => (
                 build_demo_room(),
                 Vec::new(),
+                None,
                 false,
                 Vec3::new(0.0, walk_cfg.radius, 4.2),
                 0.0,
@@ -115,7 +120,7 @@ fn main() {
     let mut fb = Framebuffer::new(W, H);
     let mut perf = PerfMonitor::new();
 
-    let eye_offset = Vec3::new(0.0, EYE_HEIGHT - walk_cfg.radius, 0.0);
+    let eye_offset = Vec3::new(0.0, eye_height - walk_cfg.radius, 0.0);
     let mut walker = Walker::new(walk_cfg, body_start);
     let mut bob = ViewBob::new();
     let mut prev_body_pos = walker.pos;
@@ -137,6 +142,7 @@ fn main() {
         fog_start: 4.5,
         fog_end: default_fog_end,
         light_dir: Vec3::new(0.45, 0.82, 0.35).normalize(),
+        sky_tex_id,
     };
 
     let mut step_acc = 0.0_f32;

@@ -4,7 +4,7 @@
 //! `SSECTORS`, `NODES`, `SECTORS`) plus `PLAYPAL`, flats (`F_START..F_END`), `PNAMES`,
 //! and `TEXTURE1`/`TEXTURE2`, converting them into `Vec<Tri>`, `Vec<Texture>`, and Player 1 spawn.
 
-use crate::scene::{Texture, Tri, NO_TEX};
+use crate::scene::{Texture, Tri, NO_TEX, SKY_TEX};
 use sliver_math::Vec3;
 use std::collections::HashMap;
 use std::fs;
@@ -12,16 +12,21 @@ use std::path::Path;
 
 /// Scale from Doom map units to Sliver meters (~36 units = 1 m).
 const DOOM_SCALE: f32 = 1.0 / 36.0;
+/// Classic Doom stretched 320x200 to 4:3 CRT, making pixels 1.2x taller than wide.
+const DOOM_Y_SCALE: f32 = DOOM_SCALE * 1.2;
 const NO_SIDEDEF: u16 = 0xFFFF;
 const SUBSECTOR_BIT: u16 = 0x8000;
 const ML_DONTPEGTOP: u16 = 0x0008;
 const ML_DONTPEGBOTTOM: u16 = 0x0010;
+const SKY_FALLBACK_COLOR: [u8; 3] = [104, 140, 184];
 
 #[derive(Debug)]
 pub struct WadMap {
     pub name: String,
     pub tris: Vec<Tri>,
     pub textures: Vec<Texture>,
+    /// Index into `textures` for the map's panoramic sky (`SKY1`..`SKY4`), if present.
+    pub sky_tex_id: Option<u16>,
     /// Floor position (x, floor_y, z) of Player 1 in Sliver coordinates.
     pub spawn_pos: Vec3,
     /// Initial camera yaw (radians) matching Sliver's `fwd = (sin(yaw), 0, -cos(yaw))`.
@@ -203,7 +208,7 @@ impl<'a> TexLoader<'a> {
         let (Some(pal), Some(&raw)) = (self.palette, self.flat_lumps.get(name)) else {
             return NO_TEX;
         };
-        if self.textures.len() >= NO_TEX as usize {
+        if self.textures.len() >= SKY_TEX as usize {
             return NO_TEX;
         }
         let pixels: Vec<u32> = raw.iter().map(|&idx| pal[idx as usize]).collect();
@@ -224,7 +229,7 @@ impl<'a> TexLoader<'a> {
         let (Some(pal), Some(def)) = (self.palette, self.wall_defs.get(name).cloned()) else {
             return (NO_TEX, 128.0);
         };
-        if def.width == 0 || def.height == 0 || self.textures.len() >= NO_TEX as usize {
+        if def.width == 0 || def.height == 0 || self.textures.len() >= SKY_TEX as usize {
             return (NO_TEX, 128.0);
         }
 
@@ -373,6 +378,14 @@ fn read_name8(b: &[u8], off: usize) -> [u8; 8] {
     out
 }
 
+fn name8(s: &str) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    for (dst, &src) in out.iter_mut().zip(s.as_bytes()) {
+        *dst = src.to_ascii_uppercase();
+    }
+    out
+}
+
 fn name_str(name: &[u8; 8]) -> &str {
     let len = name.iter().position(|&c| c == 0).unwrap_or(8);
     std::str::from_utf8(&name[..len]).unwrap_or("")
@@ -382,13 +395,33 @@ fn is_sky(name: &[u8; 8]) -> bool {
     name_str(name) == "F_SKY1"
 }
 
+fn sky_texture_name(map_name: &str) -> [u8; 8] {
+    let up = map_name.to_ascii_uppercase();
+    if let Some(rest) = up.strip_prefix("MAP") {
+        if let Ok(num) = rest.parse::<u32>() {
+            return match num {
+                1..=11 => name8("SKY1"),
+                12..=20 => name8("SKY2"),
+                _ => name8("SKY3"),
+            };
+        }
+    } else if up.starts_with("E2") {
+        return name8("SKY2");
+    } else if up.starts_with("E3") {
+        return name8("SKY3");
+    } else if up.starts_with("E4") {
+        return name8("SKY4");
+    }
+    name8("SKY1")
+}
+
 fn is_manual_door_special(special: u16) -> bool {
     matches!(special, 1 | 26 | 27 | 28 | 31 | 32 | 33 | 34 | 117 | 118)
 }
 
 #[inline]
 fn doom_to_sliver(dx: f32, dy: f32, dz: f32) -> Vec3 {
-    Vec3::new(dx * DOOM_SCALE, dz * DOOM_SCALE, -dy * DOOM_SCALE)
+    Vec3::new(dx * DOOM_SCALE, dz * DOOM_Y_SCALE, -dy * DOOM_SCALE)
 }
 
 fn parse_directory(bytes: &[u8]) -> Result<Vec<Lump<'_>>, String> {
@@ -482,6 +515,12 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
     let resolved_name = name_str(&lumps[map_idx].name).to_string();
 
     let mut tex_loader = TexLoader::from_lumps(&lumps);
+    let sky_name = sky_texture_name(&resolved_name);
+    let (mut sky_id, _) = tex_loader.get_wall(&sky_name);
+    if sky_id == NO_TEX && sky_name != name8("SKY1") {
+        sky_id = tex_loader.get_wall(&name8("SKY1")).0;
+    }
+    let sky_tex_id = (sky_id != NO_TEX).then_some(sky_id);
 
     let things_b = find_map_lump(&lumps, map_idx, "THINGS")?;
     let linedefs_b = find_map_lump(&lumps, map_idx, "LINEDEFS")?;
@@ -493,7 +532,9 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
     let sectors_b = find_map_lump(&lumps, map_idx, "SECTORS")?;
 
     let things: Vec<Thing> = things_b
-        .as_chunks::<10>().0.iter()
+        .as_chunks::<10>()
+        .0
+        .iter()
         .map(|c| Thing {
             x: read_i16(c, 0),
             y: read_i16(c, 2),
@@ -503,12 +544,16 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let verts: Vec<(f32, f32)> = vertexes_b
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| (read_i16(c, 0) as f32, read_i16(c, 2) as f32))
         .collect();
 
     let linedefs: Vec<Linedef> = linedefs_b
-        .as_chunks::<14>().0.iter()
+        .as_chunks::<14>()
+        .0
+        .iter()
         .map(|c| Linedef {
             v1: read_u16(c, 0),
             v2: read_u16(c, 2),
@@ -520,7 +565,9 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let sidedefs: Vec<Sidedef> = sidedefs_b
-        .as_chunks::<30>().0.iter()
+        .as_chunks::<30>()
+        .0
+        .iter()
         .map(|c| Sidedef {
             x_off: read_i16(c, 0),
             y_off: read_i16(c, 2),
@@ -532,7 +579,9 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let segs: Vec<Seg> = segs_b
-        .as_chunks::<12>().0.iter()
+        .as_chunks::<12>()
+        .0
+        .iter()
         .map(|c| Seg {
             linedef: read_u16(c, 6),
             direction: read_i16(c, 8),
@@ -540,7 +589,9 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let ssectors: Vec<Subsector> = ssectors_b
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| Subsector {
             num_segs: read_u16(c, 0),
             first_seg: read_u16(c, 2),
@@ -548,7 +599,9 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let nodes: Vec<Node> = nodes_b
-        .as_chunks::<28>().0.iter()
+        .as_chunks::<28>()
+        .0
+        .iter()
         .map(|c| Node {
             x: read_i16(c, 0),
             y: read_i16(c, 2),
@@ -560,7 +613,9 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         .collect();
 
     let mut sectors: Vec<Sector> = sectors_b
-        .as_chunks::<26>().0.iter()
+        .as_chunks::<26>()
+        .0
+        .iter()
         .map(|c| Sector {
             floor_h: read_i16(c, 0),
             ceil_h: read_i16(c, 2),
@@ -635,33 +690,50 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
             let f_light = f_sec.light.clamp(0, 255) as u8;
             let b_light = b_sec.light.clamp(0, 255) as u8;
 
-            // Front upper/lower trims (normal pointing into front sector).
-            if f_sec.ceil_h > b_sec.ceil_h && !both_sky {
-                let (tex_id, tex_h) = tex_loader.get_wall(&f_sd.upper_tex);
+            // Front upper trim (or sky occluder when both sectors have F_SKY1).
+            if f_sec.ceil_h > b_sec.ceil_h {
                 let y_bot = b_sec.ceil_h as f32;
                 let y_top = f_sec.ceil_h as f32;
-                let (v_top, v_bot) = if dont_peg_top {
-                    let vt = f_sd.y_off as f32;
-                    (vt, vt + (y_top - y_bot))
+                if both_sky {
+                    push_wall(
+                        &mut tris,
+                        p1,
+                        p2,
+                        y_bot,
+                        y_top,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        SKY_FALLBACK_COLOR,
+                        SKY_TEX,
+                        255,
+                    );
                 } else {
-                    let vb = tex_h + f_sd.y_off as f32;
-                    (vb - (y_top - y_bot), vb)
-                };
-                let col = shade_surface(SurfaceKind::Trim, &f_sd.upper_tex, f_sec.light);
-                push_wall(
-                    &mut tris,
-                    p1,
-                    p2,
-                    y_bot,
-                    y_top,
-                    f_sd.x_off as f32,
-                    f_sd.x_off as f32 + wall_len,
-                    v_top,
-                    v_bot,
-                    col,
-                    tex_id,
-                    f_light,
-                );
+                    let (tex_id, tex_h) = tex_loader.get_wall(&f_sd.upper_tex);
+                    let (v_top, v_bot) = if dont_peg_top {
+                        let vt = f_sd.y_off as f32;
+                        (vt, vt + (y_top - y_bot))
+                    } else {
+                        let vb = tex_h + f_sd.y_off as f32;
+                        (vb - (y_top - y_bot), vb)
+                    };
+                    let col = shade_surface(SurfaceKind::Trim, &f_sd.upper_tex, f_sec.light);
+                    push_wall(
+                        &mut tris,
+                        p1,
+                        p2,
+                        y_bot,
+                        y_top,
+                        f_sd.x_off as f32,
+                        f_sd.x_off as f32 + wall_len,
+                        v_top,
+                        v_bot,
+                        col,
+                        tex_id,
+                        f_light,
+                    );
+                }
             }
             if b_sec.floor_h > f_sec.floor_h {
                 let (tex_id, _) = tex_loader.get_wall(&f_sd.lower_tex);
@@ -694,33 +766,50 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
                 );
             }
 
-            // Back upper/lower trims (normal pointing into back sector: swap p1, p2).
-            if b_sec.ceil_h > f_sec.ceil_h && !both_sky {
-                let (tex_id, tex_h) = tex_loader.get_wall(&b_sd.upper_tex);
+            // Back upper trim (or sky occluder when both sectors have F_SKY1).
+            if b_sec.ceil_h > f_sec.ceil_h {
                 let y_bot = f_sec.ceil_h as f32;
                 let y_top = b_sec.ceil_h as f32;
-                let (v_top, v_bot) = if dont_peg_top {
-                    let vt = b_sd.y_off as f32;
-                    (vt, vt + (y_top - y_bot))
+                if both_sky {
+                    push_wall(
+                        &mut tris,
+                        p2,
+                        p1,
+                        y_bot,
+                        y_top,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        SKY_FALLBACK_COLOR,
+                        SKY_TEX,
+                        255,
+                    );
                 } else {
-                    let vb = tex_h + b_sd.y_off as f32;
-                    (vb - (y_top - y_bot), vb)
-                };
-                let col = shade_surface(SurfaceKind::Trim, &b_sd.upper_tex, b_sec.light);
-                push_wall(
-                    &mut tris,
-                    p2,
-                    p1,
-                    y_bot,
-                    y_top,
-                    b_sd.x_off as f32,
-                    b_sd.x_off as f32 + wall_len,
-                    v_top,
-                    v_bot,
-                    col,
-                    tex_id,
-                    b_light,
-                );
+                    let (tex_id, tex_h) = tex_loader.get_wall(&b_sd.upper_tex);
+                    let (v_top, v_bot) = if dont_peg_top {
+                        let vt = b_sd.y_off as f32;
+                        (vt, vt + (y_top - y_bot))
+                    } else {
+                        let vb = tex_h + b_sd.y_off as f32;
+                        (vb - (y_top - y_bot), vb)
+                    };
+                    let col = shade_surface(SurfaceKind::Trim, &b_sd.upper_tex, b_sec.light);
+                    push_wall(
+                        &mut tris,
+                        p2,
+                        p1,
+                        y_bot,
+                        y_top,
+                        b_sd.x_off as f32,
+                        b_sd.x_off as f32 + wall_len,
+                        v_top,
+                        v_bot,
+                        col,
+                        tex_id,
+                        b_light,
+                    );
+                }
             }
             if f_sec.floor_h > b_sec.floor_h {
                 let (tex_id, _) = tex_loader.get_wall(&b_sd.lower_tex);
@@ -814,6 +903,7 @@ pub fn load_wad_map_bytes(bytes: &[u8], map_name: Option<&str>) -> Result<WadMap
         name: resolved_name,
         tris,
         textures: tex_loader.textures,
+        sky_tex_id,
         spawn_pos: doom_to_sliver(spawn_x, spawn_y, floor_z),
         spawn_yaw: (90.0 - spawn_angle).to_radians(),
     })
@@ -993,8 +1083,15 @@ fn emit_subsector_flats(ctx: &mut BspBuildCtx<'_, '_>, ss_idx: usize, mut poly: 
     }
 
     let sec_light = sec.light.clamp(0, 255) as u8;
-    let floor_tex_id = ctx.tex_loader.get_flat(&sec.floor_tex);
-    let floor_col = shade_surface(SurfaceKind::Floor, &sec.floor_tex, sec.light);
+    let (floor_tex_id, floor_col, floor_light) = if is_sky(&sec.floor_tex) {
+        (SKY_TEX, SKY_FALLBACK_COLOR, 255)
+    } else {
+        (
+            ctx.tex_loader.get_flat(&sec.floor_tex),
+            shade_surface(SurfaceKind::Floor, &sec.floor_tex, sec.light),
+            sec_light,
+        )
+    };
     let fy = sec.floor_h as f32;
     let p0_f = doom_to_sliver(poly[0].0 as f32, poly[0].1 as f32, fy);
     let uv0 = [poly[0].0 as f32, -(poly[0].1 as f32)];
@@ -1013,13 +1110,20 @@ fn emit_subsector_flats(ctx: &mut BspBuildCtx<'_, '_>, ss_idx: usize, mut poly: 
             uv2,
             floor_col,
             floor_tex_id,
-            sec_light,
+            floor_light,
         );
     }
 
-    if !is_sky(&sec.ceil_tex) && sec.ceil_h > sec.floor_h {
-        let ceil_tex_id = ctx.tex_loader.get_flat(&sec.ceil_tex);
-        let ceil_col = shade_surface(SurfaceKind::Ceiling, &sec.ceil_tex, sec.light);
+    if sec.ceil_h > sec.floor_h {
+        let (ceil_tex_id, ceil_col, ceil_light) = if is_sky(&sec.ceil_tex) {
+            (SKY_TEX, SKY_FALLBACK_COLOR, 255)
+        } else {
+            (
+                ctx.tex_loader.get_flat(&sec.ceil_tex),
+                shade_surface(SurfaceKind::Ceiling, &sec.ceil_tex, sec.light),
+                sec_light,
+            )
+        };
         let cy = sec.ceil_h as f32;
         let p0_c = doom_to_sliver(poly[0].0 as f32, poly[0].1 as f32, cy);
         for i in 1..poly.len() - 1 {
@@ -1037,7 +1141,7 @@ fn emit_subsector_flats(ctx: &mut BspBuildCtx<'_, '_>, ss_idx: usize, mut poly: 
                 uv2,
                 ceil_col,
                 ceil_tex_id,
-                sec_light,
+                ceil_light,
             );
         }
     }
@@ -1384,12 +1488,24 @@ mod tests {
     }
 
     #[test]
-    fn sky_ceiling_omits_ceiling_triangles() {
+    fn sky_ceiling_emits_sky_tagged_triangles() {
         let wad = build_wad(&synthetic_box_lumps("F_SKY1"));
         let map = load_wad_map_bytes(&wad, Some("e1m1")).expect("sky WAD should parse");
-        let ceil_tris = map.tris.iter().filter(|t| t.normal().y < -0.99).count();
-        assert_eq!(ceil_tris, 0);
-        assert_eq!(map.tris.len(), 10);
+        let ceil_tris: Vec<_> = map.tris.iter().filter(|t| t.normal().y < -0.99).collect();
+        assert_eq!(ceil_tris.len(), 2);
+        assert!(ceil_tris.iter().all(|t| t.tex_id == SKY_TEX));
+        assert_eq!(map.tris.len(), 12);
+    }
+
+    #[test]
+    fn sky_texture_name_matches_doom_episodes_and_doom2() {
+        assert_eq!(name_str(&sky_texture_name("E1M1")), "SKY1");
+        assert_eq!(name_str(&sky_texture_name("E2M2")), "SKY2");
+        assert_eq!(name_str(&sky_texture_name("E3M6")), "SKY3");
+        assert_eq!(name_str(&sky_texture_name("E4M1")), "SKY4");
+        assert_eq!(name_str(&sky_texture_name("MAP01")), "SKY1");
+        assert_eq!(name_str(&sky_texture_name("MAP15")), "SKY2");
+        assert_eq!(name_str(&sky_texture_name("MAP30")), "SKY3");
     }
 
     #[test]
@@ -1422,6 +1538,7 @@ mod tests {
         let err = load_wad_map_bytes(b"NOPE00000000", None).unwrap_err();
         assert!(err.contains("Invalid WAD header"));
     }
+
     #[test]
     fn rounded_two_sided_seg_does_not_open_floor_wedge() {
         let mut things = Vec::new();
@@ -1431,7 +1548,13 @@ mod tests {
 
         // 256x256 room plus vertex 4 rounded off the diagonal (-128,-128)->(128,128).
         let mut verts = Vec::new();
-        for (x, y) in [(-128i16, -128i16), (-128, 128), (128, 128), (128, -128), (0, -2)] {
+        for (x, y) in [
+            (-128i16, -128i16),
+            (-128, 128),
+            (128, 128),
+            (128, -128),
+            (0, -2),
+        ] {
             verts.extend_from_slice(&x.to_le_bytes());
             verts.extend_from_slice(&y.to_le_bytes());
         }
